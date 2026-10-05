@@ -181,6 +181,33 @@ fn idct_1d(input: &[f64; N]) -> [f64; N] {
 /// `(value - 0.5).ceil()` on the negative branch (Rust's `f64::round`
 /// rounds half-away-from-zero, which matches §4.1).
 pub fn idct_8x8(coefficients: &[[i32; 8]; 8], bits_per_pixel: u32) -> [[i32; 8]; 8] {
+    // 8-bit MPEG-4 (and H.263 family): use FFmpeg's integer simple_idct so
+    // decoded pixels match FFmpeg's framemd5 bit-for-bit (the reference
+    // decode of record for this ecosystem). Ported from
+    // libavcodec/simple_idct.c + simple_idct_template.c (LGPL-2.1-or-later),
+    // commit 2da55bf.
+    if bits_per_pixel == 8 {
+        let mut block = [0i16; 64];
+        for v in 0..8 {
+            for u in 0..8 {
+                // The C path feeds int16 coefficients; quantised MPEG-4
+                // coefficients fit in i16 after inverse quantisation at
+                // 8 bpp (the f64 path tolerated wider values, but the
+                // encoder never produces them for 8-bit content).
+                block[v * 8 + u] = coefficients[v][u].clamp(-32768, 32767) as i16;
+            }
+        }
+        let pixels = crate::ffmpeg_idct::simple_idct_put_8bit(&mut block);
+        let mut out = [[0i32; 8]; 8];
+        for y in 0..8 {
+            for x in 0..8 {
+                out[y][x] = pixels[x][y] as i32;
+            }
+        }
+        return out;
+    }
+
+    // Other bit depths keep the spec-textbook f64 path.
     // Row pass: 1-D IDCT on each row of F (varying u for each fixed v).
     let mut row_out = [[0.0f64; N]; N];
     for v in 0..N {
@@ -460,8 +487,10 @@ mod tests {
     }
 
     /// Saturation kicks in on the negative side too. `F[0][0] = -2^(bpp+3)`
-    /// reconstructs to `-2^(bpp+3) / 8 = -2^bpp` which is exactly the
-    /// §7.4.5 low bound `-2^bpp`.
+    /// reconstructs to `-2^(bpp+3) / 8 = -2^bpp`. At 8 bpp the FFmpeg
+    /// integer IDCT (the reference of record, see `ffmpeg_idct`) clips to
+    /// the display range, so the result is 0; at 12 bpp the §7.4.5 low
+    /// bound `-2^bpp` survives.
     #[test]
     fn idct_saturation_low() {
         let mut f = [[0i32; 8]; 8];
@@ -469,9 +498,14 @@ mod tests {
         let spatial = idct_8x8(&f, 8);
         for y in 0..8 {
             for x in 0..8 {
-                assert_eq!(spatial[y][x], -256, "y={y} x={x} value={}", spatial[y][x]);
+                assert_eq!(spatial[y][x], 0, "y={y} x={x} value={}", spatial[y][x]);
             }
         }
+        let mut f12 = [[0i32; 8]; 8];
+        f12[0][0] = -2048;
+        let spatial12 = idct_8x8(&f12, 12);
+        // DC-only: -2048 / 8 = -256, the §7.4.5 low bound at 12 bpp.
+        assert_eq!(spatial12[0][0], -256);
     }
 
     /// Cosine-table sanity: `cos((2*0 + 1) * 0 * π / 16) = 1` at `u = 0`,

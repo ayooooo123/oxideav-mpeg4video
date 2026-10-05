@@ -354,6 +354,7 @@ pub mod gmc;
 pub mod half_sample;
 #[doc(hidden)]
 pub mod idct;
+pub mod ffmpeg_idct;
 #[doc(hidden)]
 pub mod interlaced_information;
 #[doc(hidden)]

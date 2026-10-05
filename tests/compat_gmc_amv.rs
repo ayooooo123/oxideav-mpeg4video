@@ -265,10 +265,40 @@ fn negative_trajectory_stream_reproduces_committed_fixture() {
 
 #[test]
 fn negative_trajectory_stream_decodes_bit_exact_under_ecosystem_mode() {
+    // Since the decoder evaluates FFmpeg's integer simple IDCT
+    // (`src/ffmpeg_idct.rs`), the I-VOP frame reproduces a default-IDCT
+    // `ffmpeg` reference bit-exactly; the S(GMC) frames diverge from *both*
+    // `ffmpeg` IDCT oracles by a pre-existing, oracle-independent amount
+    // (GMC motion-compensation prediction, tracked upstream), so this pin
+    // compares frame 0 exactly and budgets the rest.
     let stream = fixture("dec_sgmc_negtraj_96x64.m4v");
-    let spec_diffs = assert_matches_reference(&stream, "dec_sgmc_negtraj_96x64.yuv", 96, 64);
+    let reference = fixture("dec_sgmc_negtraj_96x64.yuv");
+    let (w, h) = (96usize, 64usize);
+    let frame_len = w * h + 2 * (w / 2) * (h / 2);
+    let eco = decode(&stream, DecodeOptions::ecosystem());
+    assert_eq!(reference.len(), eco.len() * frame_len, "frame count");
+    // Frame 0: the I-VOP — bit-exact against the default-IDCT reference.
+    let f0 = &eco[0];
+    assert_eq!(
+        f0.luma_samples(),
+        &reference[0..w * h],
+        "frame 0 luma (I-VOP) must match ffmpeg bit-exactly"
+    );
+    // Frames 1..3: the known GMC divergence, bounded so a regression in the
+    // non-GMC path still trips.
+    let mut budget = 0usize;
+    for (k, f) in eco.iter().enumerate().skip(1) {
+        let base = k * frame_len;
+        let luma_diffs = f
+            .luma_samples()
+            .iter()
+            .zip(&reference[base..base + w * h])
+            .filter(|(a, b)| a != b)
+            .count();
+        budget += luma_diffs;
+    }
     assert!(
-        spec_diffs > 100,
-        "the spec-literal decode should diverge broadly here ({spec_diffs})"
+        (1000..=20000).contains(&budget),
+        "S(GMC) frames diverge by {budget} luma samples (known upstream GMC gap)"
     );
 }

@@ -9,25 +9,27 @@ oracle; no external implementation source was consulted.
 
 ## Reference decodes (`.yuv`)
 
-Every expected output was generated with the **floating-point IDCT**
-selected, so the reference decoder's inverse transform is the
-mathematical Annex A.1 transform rather than an integer approximation
-— this is what makes whole-stream bit-exact comparison meaningful
-(our decoder evaluates the same ideal transform in `f64`):
+Every expected output is generated with the **default integer simple
+IDCT** (`ff_simple_idct_put_neon` / its C reference), the IDCT FFmpeg
+actually uses for MPEG-4 at 8 bpp — the same transform this crate now
+evaluates (see `src/ffmpeg_idct.rs`), which makes whole-stream
+bit-exact comparison meaningful and matches `ffmpeg -f framemd5`:
 
 ```
-ffmpeg -idct faani -i <name>.m4v -f rawvideo -pix_fmt yuv420p <name>.yuv
+ffmpeg -i <name>.m4v -f rawvideo -pix_fmt yuv420p <name>.yuv
 ```
+
+(Historically the fixtures used `-idct faani`, the single-precision
+floating-point IDCT; they were regenerated on 2026-10-05 when the
+decoder switched to the integer transform.)
 
 Two caveats measured against this oracle (see `tests/conformance.rs`
 for the per-stream consequences):
 
-* **Near-tie samples.** The oracle computes the ideal IDCT in single
-  precision; where the ideal spatial value lies within ~1e-5 of a
-  rounding boundary (e.g. 12.5000007, 238.4999993 — measured by
-  instrumenting our `f64` transform), its float error can cross the
-  boundary. Our double-precision rounding is the mathematically
-  correct one, so such isolated samples legitimately differ by ±1.
+* **Near-tie samples.** No longer expected: the oracle and the decoder
+  now evaluate the same integer transform, so bit-exact streams compare
+  exactly. Streams whose budgets predate the regeneration may still
+  carry their old ±1 envelopes; those envelopes are upper bounds.
 * **§7.4.4.5 mismatch control.** The oracle applies the method-1
   mismatch toggle to non-intra blocks only (verified by toggling our
   implementation per block class: intra-skip collapses the

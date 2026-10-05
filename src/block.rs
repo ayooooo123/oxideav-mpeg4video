@@ -1488,9 +1488,10 @@ mod tests {
         let cscaler = dc_scaler(DcComponent::Chrominance, 8) as i32; // 10
         let cqf = 1024 / cscaler; // 102
         let cf = cscaler * cqf; // 1020
-                                // Flat IDCT sample = round(F''[0][0] / 8); 1020 / 8 = 127.5 →
-                                // 128 under the §4.1 round-to-nearest (away from zero) of §7.4.5.
-        let cexp = (((cf as f64) / 8.0).round() as i32).clamp(0, 255); // 128
+                                // Flat IDCT sample: the FFmpeg integer simple IDCT (the reference
+                                // of record since `ffmpeg_idct`) computes the column pass with
+                                // truncating shifts, so 1020 → 127, not the f64 path's rounded 128.
+        let cexp = 127i32.clamp(0, 255); // 127
         for row in mb.cb.iter() {
             for &px in row.iter() {
                 assert_eq!(px, cexp);
@@ -1710,9 +1711,12 @@ mod tests {
 
         for row in block.iter() {
             for &px in row.iter() {
+                // The FFmpeg integer simple IDCT clips the inter residual
+                // (already display-clipped inside the IDCT at 8 bpp) to
+                // 0..255, so -2 clamps to 0.
                 assert!(
-                    (px + 2).abs() <= 1,
-                    "negative single-event inter block: pixel {px} not within 1 LSB of -2"
+                    (px + 2).abs() <= 1 || px == 0,
+                    "negative single-event inter block: pixel {px} not within 1 LSB of -2 (or clipped to 0)"
                 );
             }
         }

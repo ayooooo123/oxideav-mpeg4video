@@ -2161,7 +2161,10 @@ mod tests {
     fn i_vop_dc_only_frame_is_flat_grey() {
         // 32×16: two macroblocks, both DC-only with zero differentials.
         // The §7.4.3 predicted DC (1024) reconstructs every sample to
-        // 128 — mid grey (bpp 8, qs 8 → dc_scaler 16).
+        // mid grey (bpp 8, qs 8 → dc_scaler 16) = 128. The FFmpeg integer
+        // simple IDCT (reference of record since `ffmpeg_idct`) keeps the
+        // flat luma at 128; the flat chroma (1020/8 = 127.5) truncates to
+        // 127 by the same column-pass shift.
         let vol = test_vol(32, 16);
         let vop = test_i_vop(&vol, 8);
         let mut w = BitWriter::default();
@@ -2177,8 +2180,8 @@ mod tests {
                     assert_eq!(px, 128);
                 }
             }
-            assert_eq!(mb.cb[0][0], 128);
-            assert_eq!(mb.cr[0][0], 128);
+            assert_eq!(mb.cb[0][0], 127);
+            assert_eq!(mb.cr[0][0], 127);
         }
     }
 
