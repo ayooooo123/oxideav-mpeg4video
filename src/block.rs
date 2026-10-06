@@ -948,9 +948,10 @@ pub fn inter_block_from_events(
         inverse_quant_method2(&qf, iq_ctx)
     };
 
-    // §7.4.5 + Annex A — inverse DCT. `idct_8x8` already saturates to
-    // [-2^bpp, 2^bpp - 1]; the result is the §7.3 step-2 residual.
-    Ok(idct_8x8(&f, ctx.bits_per_pixel))
+    // §7.4.5 + Annex A — inverse DCT. The inter residual is signed:
+    // FFmpeg's inter path uses add-semantics (no 0..255 clip; the clip
+    // happens after the §7.3 prediction add) — see `idct_8x8_inter_residual`.
+    Ok(crate::idct::idct_8x8_inter_residual(&f, ctx.bits_per_pixel))
 }
 
 /// Decode and reconstruct one inter 4:2:0 macroblock's signed-residual

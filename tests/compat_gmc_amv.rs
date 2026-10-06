@@ -265,29 +265,19 @@ fn negative_trajectory_stream_reproduces_committed_fixture() {
 
 #[test]
 fn negative_trajectory_stream_decodes_bit_exact_under_ecosystem_mode() {
-    // Since the decoder evaluates FFmpeg's integer simple IDCT
-    // (`src/ffmpeg_idct.rs`), the I-VOP frame reproduces a default-IDCT
-    // `ffmpeg` reference bit-exactly; the S(GMC) frames diverge from *both*
-    // `ffmpeg` IDCT oracles by a pre-existing, oracle-independent amount
-    // (GMC motion-compensation prediction, tracked upstream), so this pin
-    // compares frame 0 exactly and budgets the rest.
+    // The decoder evaluates FFmpeg's integer simple IDCT
+    // (`src/ffmpeg_idct.rs`) with add-semantics on inter/S(GMC) residuals
+    // (see `idct_8x8_inter_residual`), so every frame reproduces the
+    // default-IDCT `ffmpeg` reference bit-exactly — including the S(GMC)
+    // frames (the once-documented GMC divergence was the residual-clip
+    // bug, fixed with the add-semantics IDCT).
     let stream = fixture("dec_sgmc_negtraj_96x64.m4v");
     let reference = fixture("dec_sgmc_negtraj_96x64.yuv");
     let (w, h) = (96usize, 64usize);
     let frame_len = w * h + 2 * (w / 2) * (h / 2);
     let eco = decode(&stream, DecodeOptions::ecosystem());
     assert_eq!(reference.len(), eco.len() * frame_len, "frame count");
-    // Frame 0: the I-VOP — bit-exact against the default-IDCT reference.
-    let f0 = &eco[0];
-    assert_eq!(
-        f0.luma_samples(),
-        &reference[0..w * h],
-        "frame 0 luma (I-VOP) must match ffmpeg bit-exactly"
-    );
-    // Frames 1..3: the known GMC divergence, bounded so a regression in the
-    // non-GMC path still trips.
-    let mut budget = 0usize;
-    for (k, f) in eco.iter().enumerate().skip(1) {
+    for (k, f) in eco.iter().enumerate() {
         let base = k * frame_len;
         let luma_diffs = f
             .luma_samples()
@@ -295,10 +285,9 @@ fn negative_trajectory_stream_decodes_bit_exact_under_ecosystem_mode() {
             .zip(&reference[base..base + w * h])
             .filter(|(a, b)| a != b)
             .count();
-        budget += luma_diffs;
+        assert_eq!(
+            luma_diffs, 0,
+            "frame {k} must match ffmpeg bit-exactly ({luma_diffs} luma diffs)"
+        );
     }
-    assert!(
-        (1000..=20000).contains(&budget),
-        "S(GMC) frames diverge by {budget} luma samples (known upstream GMC gap)"
-    );
 }

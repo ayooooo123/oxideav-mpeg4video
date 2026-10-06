@@ -518,7 +518,7 @@ pub use half_sample::{
     fetch_clamped_sample, interpolate_block, interpolate_block_into, interpolate_pixel,
     split_half_pel, ReferenceVop,
 };
-pub use idct::{idct_8x8, idct_saturation_bounds, saturate_idct_sample};
+pub use idct::{idct_8x8, idct_8x8_inter_residual, idct_saturation_bounds, saturate_idct_sample};
 #[doc(hidden)]
 pub use interlaced_information::{
     dct_type_present, field_prediction_present, parse_interlaced_information, DctType,
@@ -865,8 +865,10 @@ pub use encoder::{make_encoder, Mpeg4EncoderOptions, Mpeg4VideoEncoder};
 /// Register the MPEG-4 Part 2 Visual decoder with the runtime codec
 /// registry under the id `mpeg4video`, claiming the common container
 /// tags for the format — the MPEG-4 Visual FourCCs (`XVID` / `DIVX` /
-/// `DX50` / `FMP4` / `MP4V` / `M4S2`) and the MP4
-/// ObjectTypeIndication `0x20` (ISO/IEC 14496-2 Visual).
+/// `DX50` / `FMP4` / `MP4V` / `M4S2`), the MP4
+/// ObjectTypeIndication `0x20` (ISO/IEC 14496-2 Visual), and Matroska's
+/// MPEG-4 Part 2 CodecIDs (`V_MPEG4/ISO/ASP` / `V_MPEG4/ISO/SP` /
+/// `V_MPEG4/ISO/AP`).
 ///
 /// The decoder factory recognises the [`Mpeg4DecoderOptions`] schema
 /// (`ecosystem-compat`, see [`crate::compat`]) on
@@ -896,6 +898,11 @@ pub fn register(ctx: &mut RuntimeContext) {
                 CodecTag::fourcc(b"MP4V"),
                 CodecTag::fourcc(b"M4S2"),
                 CodecTag::mp4_object_type(0x20),
+                // Matroska's MPEG-4 Part 2 profiles (V_MPEG4/ISO/AVC is
+                // H.264's, V_MPEGH/ISO/HEVC is H.265's — not ours).
+                CodecTag::matroska("V_MPEG4/ISO/ASP"),
+                CodecTag::matroska("V_MPEG4/ISO/SP"),
+                CodecTag::matroska("V_MPEG4/ISO/AP"),
             ]),
     );
 }

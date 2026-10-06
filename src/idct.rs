@@ -244,6 +244,36 @@ pub fn idct_8x8(coefficients: &[[i32; 8]; 8], bits_per_pixel: u32) -> [[i32; 8];
     out
 }
 
+/// The §7.4.5 + Annex A inverse DCT for one **inter residual** block.
+///
+/// Identical transform to [`idct_8x8`], but at 8 bpp the result is **not**
+/// clipped to the display range: FFmpeg's inter path evaluates the
+/// residual with `ff_simple_idct_add_int16_8bit` (signed 16-bit store) and
+/// clips only after the §7.3 prediction add. Clipping the residual itself
+/// (the put-variant behaviour) reconstructs `max(0, residual)` and breaks
+/// every inter block with negative coefficients.
+pub fn idct_8x8_inter_residual(coefficients: &[[i32; 8]; 8], bits_per_pixel: u32) -> [[i32; 8]; 8] {
+    if bits_per_pixel == 8 {
+        let mut block = [0i16; 64];
+        for v in 0..8 {
+            for u in 0..8 {
+                block[v * 8 + u] = coefficients[v][u].clamp(-32768, 32767) as i16;
+            }
+        }
+        let pixels = crate::ffmpeg_idct::simple_idct_add_8bit(&mut block);
+        let mut out = [[0i32; 8]; 8];
+        for y in 0..8 {
+            for x in 0..8 {
+                out[y][x] = pixels[x][y] as i32;
+            }
+        }
+        return out;
+    }
+    // Non-8-bpp inter residuals keep the spec f64 path (the same transform
+    // the intra route takes; the caller clips after the prediction add).
+    idct_8x8(coefficients, bits_per_pixel)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

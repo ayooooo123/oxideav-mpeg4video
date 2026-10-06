@@ -97,6 +97,10 @@ pub fn idct_row_cond_dc(row: &mut [i16; 8]) {
 
 /// `IDCT_COLS` — the sparse column pass, reading `col[8*n]`.
 fn idct_cols(col: &[i16; 64]) -> (u32, u32, u32, u32, u32, u32, u32, u32) {
+    // `col[r * 8]` holds the column's coefficient for row `r` (the
+    // caller assembles it in the same strided layout the C's `block +
+    // c` pointer walk reads through `col[8 * n]`), so `rd(n)` mirrors
+    // the C's `col[8 * n]` reads exactly.
     let rd = |n: usize| -> u32 { col[8 * n] as i32 as u32 };
 
     let mut a0: u32 = (W4 as u32)
@@ -151,6 +155,53 @@ fn idct_cols(col: &[i16; 64]) -> (u32, u32, u32, u32, u32, u32, u32, u32) {
     (a0, a1, a2, a3, b0, b1, b2, b3)
 }
 
+/// `ff_simple_idct_add_int16_8bit` semantics for a residual block: the
+/// same row/column passes as [`simple_idct_put_8bit`] but **without** the
+/// `av_clip_pixel` — MPEG-4 inter residuals are signed and are clipped
+/// only after the §7.3 prediction add (FFmpeg's `add_dct` /
+/// `put_signed_pixels_clamped` behaviour). `out[col][row]`, values in
+/// `-2048..=2047` (the C's signed 8-bit saturating store maps to i16).
+pub fn simple_idct_add_8bit(block: &mut [i16; 64]) -> [[i16; 8]; 8] {
+    for r in 0..8 {
+        let mut row = [0i16; 8];
+        row.copy_from_slice(&block[r * 8..r * 8 + 8]);
+        idct_row_cond_dc(&mut row);
+        block[r * 8..r * 8 + 8].copy_from_slice(&row);
+    }
+    let mut out = [[0i16; 8]; 8];
+    for c in 0..8 {
+        // Mirror the C's strided view: `col[8 * r]` holds the column's
+        // coefficient for row `r` (the C reads `col[8 * n]` off `block +
+        // c`, whose `col[8*n]` is `block[8*n*8 + c]` — coefficient row
+        // `n`, column `c`).
+        let mut col = [0i16; 64];
+        for r in 0..8 {
+            col[r * 8] = block[r * 8 + c];
+        }
+        let (a0, a1, a2, a3, b0, b1, b2, b3) = idct_cols(&col);
+        // The C casts the wrapped unsigned sum/difference to `int` first,
+        // then does an arithmetic right shift; the signed store saturates
+        // to int16 instead of clipping to 0..255.
+        let px = |a: u32, b: u32| -> i16 {
+            ((a.wrapping_add(b) as i32) >> COL_SHIFT).clamp(i16::MIN as i32, i16::MAX as i32) as i16
+        };
+        let px_neg = |a: u32, b: u32| -> i16 {
+            ((a.wrapping_sub(b) as i32) >> COL_SHIFT).clamp(i16::MIN as i32, i16::MAX as i32) as i16
+        };
+        out[c] = [
+            px(a0, b0),
+            px(a1, b1),
+            px(a2, b2),
+            px(a3, b3),
+            px_neg(a3, b3),
+            px_neg(a2, b2),
+            px_neg(a1, b1),
+            px_neg(a0, b0),
+        ];
+    }
+    out
+}
+
 /// `ff_simple_idct_put_int16_8bit`: one 8×8 int16 coefficient block into
 /// clipped 0..255 pixels. `out[col][row]`.
 pub fn simple_idct_put_8bit(block: &mut [i16; 64]) -> [[u8; 8]; 8] {
@@ -162,6 +213,10 @@ pub fn simple_idct_put_8bit(block: &mut [i16; 64]) -> [[u8; 8]; 8] {
     }
     let mut out = [[0u8; 8]; 8];
     for c in 0..8 {
+        // Mirror the C's strided view: `col[8 * r]` holds the column's
+        // coefficient for row `r` (the C reads `col[8 * n]` off `block +
+        // c`, whose `col[8*n]` is `block[8*n*8 + c]` — coefficient row
+        // `n`, column `c`).
         let mut col = [0i16; 64];
         for r in 0..8 {
             col[r * 8] = block[r * 8 + c];

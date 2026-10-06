@@ -9,27 +9,29 @@ oracle; no external implementation source was consulted.
 
 ## Reference decodes (`.yuv`)
 
-Every expected output is generated with the **default integer simple
-IDCT** (`ff_simple_idct_put_neon` / its C reference), the IDCT FFmpeg
-actually uses for MPEG-4 at 8 bpp — the same transform this crate now
-evaluates (see `src/ffmpeg_idct.rs`), which makes whole-stream
-bit-exact comparison meaningful and matches `ffmpeg -f framemd5`:
+Every expected output is generated with the **C integer simple IDCT**
+(`ff_simple_idct_put_int16_8bit`, selected with `-idct simple`; this
+machine's default `AUTO` picks the NEON asm whose PARTTRANS scantable
+permutation decodes some blocks ±1 differently from the C — FFmpeg
+itself differs C-vs-NEON on several corpus files). `-idct simple` is
+also the exact transform this crate evaluates (see
+`src/ffmpeg_idct.rs`), which makes whole-stream bit-exact comparison
+meaningful and deterministic across hosts:
 
 ```
-ffmpeg -i <name>.m4v -f rawvideo -pix_fmt yuv420p <name>.yuv
+ffmpeg -idct simple -i <name>.m4v -f rawvideo -pix_fmt yuv420p <name>.yuv
 ```
 
-(Historically the fixtures used `-idct faani`, the single-precision
-floating-point IDCT; they were regenerated on 2026-10-05 when the
-decoder switched to the integer transform.)
+(Regenerated 2026-10-05: first from `-idct faani` to the default
+integer transform, then to `-idct simple` when the C-vs-NEON split was
+measured.)
 
 Two caveats measured against this oracle (see `tests/conformance.rs`
 for the per-stream consequences):
 
 * **Near-tie samples.** No longer expected: the oracle and the decoder
   now evaluate the same integer transform, so bit-exact streams compare
-  exactly. Streams whose budgets predate the regeneration may still
-  carry their old ±1 envelopes; those envelopes are upper bounds.
+  exactly.
 * **§7.4.4.5 mismatch control.** The oracle applies the method-1
   mismatch toggle to non-intra blocks only (verified by toggling our
   implementation per block class: intra-skip collapses the

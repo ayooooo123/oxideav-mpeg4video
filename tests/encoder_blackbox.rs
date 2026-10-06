@@ -684,15 +684,19 @@ fn method1_stream_decodes_against_reference_decoder_per_compat_contract() {
     // fixture — regenerate both fixture files if the encoder changes.
     assert_eq!(stats[1].1, 1, "spec-mode envelope must stay ±1");
     assert_eq!(
-        stats[1].0, 834,
+        stats[1].0, 772,
         "spec-mode differing-sample count drifted; re-measure after regenerating fixtures"
     );
 }
 
 #[test]
 fn ip_stream_reproduces_committed_fixture() {
+    let built = build_ip_stream();
+    if maybe_write_fixture("enc_ip_m2_64x64.m4v", &built) {
+        return;
+    }
     assert_eq!(
-        build_ip_stream(),
+        built,
         fixture("enc_ip_m2_64x64.m4v"),
         "encoder output drifted from the black-box-validated fixture; \
          regenerate the fixture AND its reference decode"
