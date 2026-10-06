@@ -1485,13 +1485,12 @@ mod tests {
                 assert_eq!(px, 128);
             }
         }
-        // Chroma: dc_scaler(Chrominance, qs=8) = (8+13)/2 = 10.
-        let cscaler = dc_scaler(DcComponent::Chrominance, 8) as i32; // 10
-        let cqf = 1024 / cscaler; // 102
-        let cf = cscaler * cqf; // 1020
+        // Chroma: dc_scaler(Chrominance, qs=8) = (8+13)/2 = 10; the DC
+        // wire level 1024 dequantises to 1024/cscaler = 102, and the
                                 // Flat IDCT sample: the FFmpeg integer simple IDCT (the reference
                                 // of record since `ffmpeg_idct`) computes the column pass with
-                                // truncating shifts, so 1020 → 127, not the f64 path's rounded 128.
+                                // truncating shifts, so cscaler*cqf = 1020 → 127, not the f64
+                                // path's rounded 128.
         let cexp = 127i32.clamp(0, 255); // 127
         for row in mb.cb.iter() {
             for &px in row.iter() {

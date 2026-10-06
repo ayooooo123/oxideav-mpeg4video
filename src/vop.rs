@@ -363,14 +363,6 @@ impl From<VopParseError> for VolParseError {
     }
 }
 
-fn read_marker(br: &mut BitReader<'_>) -> Result<(), VopParseError> {
-    if br.read_bool()? {
-        Ok(())
-    } else {
-        Err(VopParseError::MarkerBitMissing)
-    }
-}
-
 /// Compute the bit-width of `vop_time_increment` from the
 /// `vop_time_increment_resolution` carried in the VOL. Per §6.3.5: the
 /// minimum number of unsigned integer bits required to represent
@@ -404,7 +396,9 @@ fn parse_group_of_vop_body(br: &mut BitReader<'_>) -> Result<GovHeader, VopParse
     // Table 6-23: 5 hours + 6 minutes + 1 marker + 6 seconds = 18 bits.
     let hours = br.read_bits(5)? as u8;
     let minutes = br.read_bits(6)? as u8;
-    read_marker(br)?;
+    // FFmpeg's gop_header check_marker is advisory (INFO log); FATE
+    // demo.m4v carries a 0 here, so the bit is consumed, not validated.
+    let _gov_marker = br.read_bool()?;
     let seconds = br.read_bits(6)? as u8;
     let closed_gov = br.read_bool()?;
     let broken_link = br.read_bool()?;
@@ -505,10 +499,45 @@ fn parse_video_object_plane_body(
         // Practical upper bound: a single VOP wrapping > 4 billion
         // seconds is not a meaningful encoding. Cap at u32::MAX.
     }
-    read_marker(br)?;
-    let bits = vop_time_increment_bits(resolution) as usize;
+    // §6.3.5 places a marker_bit before and after vop_time_increment.
+    // FFmpeg's check_marker treats a wrong marker as an INFO log and
+    // keeps parsing (err_recognition off by default); real encoder
+    // streams (FATE demo.m4v) rely on that leniency, so the marker is
+    // consumed but not validated here.
+    let _before_tinc = br.read_bool()?;
+    let mut bits = vop_time_increment_bits(resolution) as usize;
+    // FFmpeg's workaround for a missing/misaligned VOL header: if the
+    // bit right after time_increment is not the vop_coded marker, the
+    // coded width is wrong — re-derive it from bitstream analysis. The
+    // expected post-tinc bit patterns differ per coding type (P/S-VOPs
+    // carry fcode bits between vop_coded and quant).
+    let is_p_like = matches!(
+        coding_type,
+        VopCodingType::P | VopCodingType::S
+    );
+    let after_tinc = br.next_bits((bits + 1).min(br.remaining_bits().max(1)))? & 1;
+    if after_tinc == 0 {
+        // Mirrored from FFmpeg mpeg4videodec.c: scan for the width whose
+        // following bits look like a valid vop_coded + shape payload.
+        let heuristic_bits = (1usize..16).find(|&b| {
+            let window = br.remaining_bits();
+            let want = if is_p_like { b + 6 } else { b + 5 };
+            if window < want {
+                return false;
+            }
+            let v = br.next_bits(want).unwrap_or(0);
+            if is_p_like {
+                (v & 0x37) == 0x30
+            } else {
+                (v & 0x1F) == 0x18
+            }
+        });
+        if let Some(b) = heuristic_bits {
+            bits = b;
+        }
+    }
     let time_increment = br.read_bits(bits)? as u16;
-    read_marker(br)?;
+    let _before_coded = br.read_bool()?;
     let coded = br.read_bool()?;
 
     // composed_ticks = modulo_time_base * resolution + time_increment.
@@ -1013,19 +1042,22 @@ mod tests {
     }
 
     #[test]
-    fn marker_violation_is_rejected() {
+    fn marker_violation_is_lenient() {
         // Hand-build a VOP header with the marker after modulo_time_base
-        // forced to 0.
+        // forced to 0. FFmpeg's check_marker only logs a wrong marker and
+        // keeps parsing (FATE demo.m4v relies on that leniency), so the
+        // fork mirrors it: the bit is consumed, parsing continues, and
+        // the truncated header surfaces as Truncated.
         let mut w = BitWriter::new();
         w.write_bits(VOP_START_CODE, 32);
         w.write_bits(0b00, 2);
         w.write_bits(0, 1); // modulo_time_base = 0
-        w.write_bits(0, 1); // marker_bit = 0 (illegal)
+        w.write_bits(0, 1); // marker_bit = 0 (illegal, advisory)
         w.align();
         let data = w.buf;
         let err =
             parse_video_object_plane_header(&data, 30_000, VopContext::default()).unwrap_err();
-        assert_eq!(err, VopParseError::MarkerBitMissing);
+        assert_eq!(err, VopParseError::Truncated);
     }
 
     #[test]
@@ -1143,16 +1175,19 @@ mod tests {
     }
 
     #[test]
-    fn group_of_vop_rejects_missing_marker() {
+    fn group_of_vop_missing_marker_is_lenient() {
         let mut w = BitWriter::new();
         w.write_bits(GROUP_OF_VOP_START_CODE, 32);
         w.write_bits(0, 5);
         w.write_bits(0, 6);
-        w.write_bits(0, 1); // marker_bit = 0 (illegal)
+        w.write_bits(0, 1); // marker_bit = 0 (illegal, advisory)
         w.align();
         let data = w.buf;
+        // FFmpeg's gop_header check_marker only logs a wrong marker and
+        // keeps parsing, so the fork mirrors it: the bit is consumed and
+        // the truncated seconds/closed/broken fields surface as Truncated.
         let err = parse_group_of_vop_header(&data).unwrap_err();
-        assert_eq!(err, VopParseError::MarkerBitMissing);
+        assert_eq!(err, VopParseError::Truncated);
     }
 
     #[test]
