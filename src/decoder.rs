@@ -350,8 +350,8 @@ impl Mpeg4VideoDecoder {
         clock.ticks = ticks;
         clock.last_tr = Some(pic.temporal_reference);
         if let Some(pending) = self.sequence.pending_anchor_mut() {
-            pending.set_pts(container_pts);
-            pending.set_pts_ticks(Some(ticks));
+            let (w, h) = pic.source_format.dimensions();
+            stamp(pending, container_pts, ticks, (u32::from(w), u32::from(h)));
         }
         Ok(())
     }
@@ -589,13 +589,11 @@ impl Mpeg4VideoDecoder {
         // §6.1.3.8 pending frame.
         if is_anchor {
             if let Some(pending) = self.sequence.pending_anchor_mut() {
-                pending.set_pts(container_pts);
-                pending.set_pts_ticks(Some(vop_ticks));
+                stamp(pending, container_pts, vop_ticks, visible_size(&vol));
             }
             self.advance_anchor_time(&vop, res);
         } else if let Some(frame) = out.last_mut() {
-            frame.set_pts(container_pts);
-            frame.set_pts_ticks(Some(vop_ticks));
+            stamp(frame, container_pts, vop_ticks, visible_size(&vol));
         }
         Ok(())
     }
@@ -634,8 +632,7 @@ impl Mpeg4VideoDecoder {
                     bpp,
                 )?);
                 if let Some(frame) = out.last_mut() {
-                    frame.set_pts(container_pts);
-                    frame.set_pts_ticks(Some(vop_ticks));
+                    stamp(frame, container_pts, vop_ticks, visible_size(vol));
                 }
             }
             _ => {
@@ -661,8 +658,7 @@ impl Mpeg4VideoDecoder {
                     bpp,
                 )?);
                 if let Some(pending) = self.sequence.pending_anchor_mut() {
-                    pending.set_pts(container_pts);
-                    pending.set_pts_ticks(Some(vop_ticks));
+                    stamp(pending, container_pts, vop_ticks, visible_size(vol));
                 }
                 self.advance_anchor_time(vop, res);
             }
@@ -703,6 +699,19 @@ impl Mpeg4VideoDecoder {
         }
         Ok((trb as i32, trd as i32))
     }
+}
+
+/// Attach to a just-decoded frame its container pts, its §6.3.5 tick time
+/// and its visible size.
+fn stamp(frame: &mut DecodedFrame, container_pts: Option<i64>, ticks: i64, size: (u32, u32)) {
+    frame.set_pts(container_pts);
+    frame.set_pts_ticks(Some(ticks));
+    frame.set_visible_size(size);
+}
+
+/// The §6.3.3 visible size of the VOPs of `vol`.
+fn visible_size(vol: &VolHeader) -> (u32, u32) {
+    (u32::from(vol.width), u32::from(vol.height))
 }
 
 /// The §6.3.3 `quarter_sample` → sub-pel-grid selection for one VOL.
@@ -833,6 +842,8 @@ pub struct Mpeg4PacketDecoder {
     /// `max_pixels_per_frame` DoS cap from `CodecParameters::limits`.
     max_pixels: u64,
     flushed: bool,
+    /// The visible size of the frame `receive_frame` last returned.
+    last_output: Option<(u32, u32)>,
 }
 
 impl std::fmt::Debug for Mpeg4PacketDecoder {
@@ -893,6 +904,25 @@ impl Mpeg4PacketDecoder {
             ],
         }
     }
+
+    /// The visible size of `frame` (its padded planes when no stream
+    /// decoder stamped one).
+    fn frame_size(frame: &DecodedFrame) -> (u32, u32) {
+        frame.visible_size().unwrap_or((
+            u32::try_from(frame.width()).unwrap_or(u32::MAX),
+            u32::try_from(frame.height()).unwrap_or(u32::MAX),
+        ))
+    }
+
+    /// The size `output_video_dimensions` reports: the frame last
+    /// returned; before the first, the next frame in display order (a
+    /// queued frame, then the held anchor), then the active VOL.
+    fn reported_size(&self) -> Option<(u32, u32)> {
+        self.last_output
+            .or_else(|| self.ready.front().map(Self::frame_size))
+            .or_else(|| self.inner.sequence.pending_anchor().map(Self::frame_size))
+            .or_else(|| self.inner.vol().map(visible_size))
+    }
 }
 
 impl oxideav_core::Decoder for Mpeg4PacketDecoder {
@@ -912,10 +942,23 @@ impl oxideav_core::Decoder for Mpeg4PacketDecoder {
 
     fn receive_frame(&mut self) -> oxideav_core::Result<oxideav_core::Frame> {
         match self.ready.pop_front() {
-            Some(frame) => Ok(oxideav_core::Frame::Video(Self::frame_to_video(&frame))),
+            Some(frame) => {
+                self.last_output = Some(Self::frame_size(&frame));
+                Ok(oxideav_core::Frame::Video(Self::frame_to_video(&frame)))
+            }
             None if self.flushed => Err(oxideav_core::Error::Eof),
             None => Err(oxideav_core::Error::NeedMore),
         }
+    }
+
+    fn output_video_dimensions(&self) -> Option<(u32, u32)> {
+        self.reported_size()
+    }
+
+    /// Every frame is planar 4:2:0 at 8 bits (§6.1.3.4).
+    fn output_pixel_format(&self) -> Option<oxideav_core::PixelFormat> {
+        self.reported_size()
+            .map(|_| oxideav_core::PixelFormat::Yuv420P)
     }
 
     fn flush(&mut self) -> oxideav_core::Result<()> {
@@ -929,6 +972,7 @@ impl oxideav_core::Decoder for Mpeg4PacketDecoder {
         self.inner = Mpeg4VideoDecoder::with_options(self.inner.options());
         self.ready.clear();
         self.flushed = false;
+        self.last_output = None;
         if !self.extradata.is_empty() {
             // Re-prime the configuration headers so the next packet
             // decodes against the same VOL.
@@ -1009,6 +1053,7 @@ pub fn make_decoder(
         extradata: params.extradata.clone(),
         max_pixels: params.limits.max_pixels_per_frame,
         flushed: false,
+        last_output: None,
     };
     if !dec.extradata.is_empty() {
         let frames = dec.inner.decode(&params.extradata).map_err(to_core_error)?;

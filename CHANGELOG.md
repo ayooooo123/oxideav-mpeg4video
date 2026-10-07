@@ -6,6 +6,15 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- `Decoder::output_video_dimensions` / `output_pixel_format`: the visible
+  size of the frame last returned (the VOL's
+  `video_object_layer_width` × `_height`, or a short-header picture's
+  source format), `Yuv420P`; before the first, the next frame in display
+  order. Frames carry it as `DecodedFrame::visible_size`. The planes stay
+  macroblock-padded.
+
 ## [0.1.8](https://github.com/OxideAV/oxideav-mpeg4video/compare/v0.1.7...v0.1.8) - 2026-09-11
 
 ### Other

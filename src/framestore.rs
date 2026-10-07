@@ -85,6 +85,9 @@ pub struct DecodedFrame {
     /// [`DecodedFrame::pts`] / [`DecodedFrame::pts_ticks`].
     pts: Option<i64>,
     pts_ticks: Option<i64>,
+    /// The visible `(width, height)` the stream decoder attached — see
+    /// [`DecodedFrame::visible_size`].
+    visible: Option<(u32, u32)>,
 }
 
 impl DecodedFrame {
@@ -120,6 +123,7 @@ impl DecodedFrame {
             coding_type,
             pts: None,
             pts_ticks: None,
+            visible: None,
         })
     }
 
@@ -156,6 +160,22 @@ impl DecodedFrame {
     #[inline]
     pub fn set_pts_ticks(&mut self, ticks: Option<i64>) {
         self.pts_ticks = ticks;
+    }
+
+    /// The visible luma size of the picture this frame holds, attached by
+    /// the stream decoder when it decoded the frame: the VOL's
+    /// `video_object_layer_width` × `_height` (§6.3.3), or a short-header
+    /// picture's source format (§6.3.5.2). The planes are macroblock-padded
+    /// beyond it. `None` for a frame no stream decoder produced.
+    #[inline]
+    pub const fn visible_size(&self) -> Option<(u32, u32)> {
+        self.visible
+    }
+
+    /// Attach the visible size (see [`DecodedFrame::visible_size`]).
+    #[inline]
+    pub fn set_visible_size(&mut self, size: (u32, u32)) {
+        self.visible = Some(size);
     }
 
     /// Luma plane width in samples (macroblock-padded).

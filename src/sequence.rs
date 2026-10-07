@@ -202,6 +202,13 @@ impl SequenceDecoder {
         self.pending_anchor.as_mut()
     }
 
+    /// The §6.1.3.8 held (pending) anchor, the next frame released for
+    /// display after any B-VOP output.
+    #[inline]
+    pub fn pending_anchor(&self) -> Option<&DecodedFrame> {
+        self.pending_anchor.as_ref()
+    }
+
     /// Decode an **interlaced** B-VOP in coding order against the
     /// bracketing anchors — the path-dispatching sibling of
     /// [`SequenceDecoder::push_b_vop`]. Displayed immediately; never
