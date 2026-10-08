@@ -14,6 +14,31 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   source format), `Yuv420P`; before the first, the next frame in display
   order. Frames carry it as `DecodedFrame::visible_size`. The planes stay
   macroblock-padded.
+- Simple Studio Profile decoding (`studio`, ported from FFmpeg 2da55bf):
+  10-bit 4:2:2, 4:4:4 and RGB intra VOPs with DCT (the 32-bit 10-bit
+  simple IDCT) or DPCM macroblocks, through the registry decoder, which
+  reports `Yuv422P10Le`, `Yuv444P10Le` or `Gbrp10Le`. FATE
+  `mpeg4_sstp_dpcm.m4v` decodes bit-exact.
+- Ecosystem-compat mode follows FFmpeg on two more clauses: 8×8
+  prediction blocks are placed within the visible area (a picture that
+  does not fill its last macroblock row or column), and not-coded VOPs
+  and B-VOPs without a past anchor or with times out of order give no
+  picture. Its registry decoder takes packets as FFmpeg's does: the
+  first VOP of each, DivX packed B-frames (user data `DivX…p`), the
+  last picture of a low-delay stream ending in a not-coded VOP shown
+  once more.
+
+### Changed
+
+- The registry decoder (`make_decoder`) defaults to ecosystem-compat
+  (`ecosystem-compat` option default `true`): it decodes as FFmpeg does.
+  Its `reset` keeps the headers in force, as FFmpeg's flush does.
+
+### Fixed
+
+- A `vop_time_increment` width derived from a VOP whose header does not
+  fit its VOL's holds for the VOPs after it, as in FFmpeg (FATE
+  `demo.m4v` decodes past its first P-VOP).
 
 ## [0.1.8](https://github.com/OxideAV/oxideav-mpeg4video/compare/v0.1.7...v0.1.8) - 2026-09-11
 

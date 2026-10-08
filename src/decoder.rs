@@ -53,7 +53,7 @@ use crate::vol::{
     VISUAL_OBJECT_SEQUENCE_START_CODE, VISUAL_OBJECT_START_CODE,
 };
 use crate::vop::{
-    parse_group_of_vop_header, parse_vop_header_body, VopCodingType, VopContext, VopHeader,
+    parse_group_of_vop_header, parse_vop_header_body_tracking, VopCodingType, VopContext, VopHeader,
     VopParseError, GROUP_OF_VOP_START_CODE, VOP_START_CODE,
 };
 use crate::vop_decode::{
@@ -92,6 +92,8 @@ pub enum StreamDecodeError {
         /// Computed `TRD` (future anchor minus past anchor, ticks).
         trd: i64,
     },
+    /// A Simple Studio Profile header or macroblock failed to decode.
+    Studio(&'static str),
 }
 
 impl core::fmt::Display for StreamDecodeError {
@@ -112,6 +114,7 @@ impl core::fmt::Display for StreamDecodeError {
                 f,
                 "stream decode: inconsistent B-VOP temporal references (TRB {trb}, TRD {trd})"
             ),
+            StreamDecodeError::Studio(what) => write!(f, "stream decode: studio profile: {what}"),
         }
     }
 }
@@ -188,6 +191,153 @@ pub struct Mpeg4VideoDecoder {
     /// running 30000/1001 Hz tick clock and the previous
     /// `temporal_reference` (modulo-256 arithmetic, §6.3.5.2).
     short_header: Option<ShortHeaderClock>,
+    /// The `vop_time_increment` width, set by each VOL and re-derived
+    /// by a VOP whose header does not fit it (see
+    /// [`parse_vop_header_body_tracking`]).
+    time_increment_bits: usize,
+    /// The encoder FFmpeg recognises from the user data (decode_user_data).
+    encoder: EncoderInfo,
+    /// FFmpeg's `low_delay`: pictures are shown as decoded, no B-VOPs.
+    low_delay: bool,
+    /// FFmpeg's `picture_number`: VOP headers of coded VOPs parsed.
+    pictures: u64,
+    /// The last VOP was a not-coded one FFmpeg skipped.
+    skipped_last_frame: bool,
+}
+
+/// The encoder a stream's user data names, as FFmpeg reads it
+/// (mpeg4videodec.c decode_user_data); `None` where none was named.
+#[derive(Debug, Clone, Copy, Default)]
+struct EncoderInfo {
+    divx_version: Option<i32>,
+    divx_build: Option<i32>,
+    /// A DivX "packed bitstream": a B-VOP rides in the packet of the
+    /// anchor before it.
+    divx_packed: bool,
+    xvid_build: Option<i32>,
+    lavc_build: Option<i32>,
+}
+
+impl EncoderInfo {
+    /// decode_user_data on the bytes after a user_data_start_code: the
+    /// text up to 255 bytes, ending before 23 zero bits.
+    fn read_user_data(&mut self, data: &[u8]) {
+        let at = |i: usize| data.get(i).copied().unwrap_or(0);
+        let len = (0..data.len().min(255))
+            .find(|&i| at(i) == 0 && at(i + 1) == 0 && at(i + 2) < 2)
+            .unwrap_or(data.len().min(255));
+        let text = &data[..len];
+        // sscanf "DivX%dBuild%d%c", else "DivX%db%d%c"
+        let mut divx = scan_divx(text, b"Build");
+        if divx.0 < 2 {
+            divx = scan_divx(text, b"b");
+        }
+        if let (count @ 2.., version, build, last) = divx {
+            self.divx_version = Some(version);
+            self.divx_build = Some(build);
+            self.divx_packed = count == 3 && last == b'p';
+        }
+        if let Some(build) = scan_lavc(text) {
+            self.lavc_build = Some(build);
+        }
+        // sscanf "XviD%d"
+        if let Some((build, _)) = text.strip_prefix(b"XviD").and_then(scan_int) {
+            self.xvid_build = Some(build);
+        }
+    }
+
+    /// ff_mpeg4_workaround_bugs, as far as the decoder uses it: an Xvid
+    /// stream is no DivX stream.
+    fn settle(&mut self) {
+        if self.xvid_build.is_some_and(|b| b >= 0) && self.divx_version.is_some_and(|v| v >= 0) {
+            self.divx_version = None;
+            self.divx_build = None;
+        }
+    }
+}
+
+/// sscanf's `%d` at the start of `s`: whitespace, a sign, then digits.
+fn scan_int(s: &[u8]) -> Option<(i32, &[u8])> {
+    let s = &s[s.iter().take_while(|c| c.is_ascii_whitespace()).count()..];
+    let (negative, s) = match s.first() {
+        Some(b'-') => (true, &s[1..]),
+        Some(b'+') => (false, &s[1..]),
+        _ => (false, s),
+    };
+    let digits = s.iter().take_while(|c| c.is_ascii_digit()).count();
+    if digits == 0 {
+        return None;
+    }
+    let value = s[..digits]
+        .iter()
+        .fold(0i64, |v, &d| (v * 10 + i64::from(d - b'0')).min(i64::from(u32::MAX)));
+    let value = if negative { -value } else { value } as i32;
+    Some((value, &s[digits..]))
+}
+
+/// sscanf `"DivX%d<sep>%d%c"`: conversions made, version, build, last.
+fn scan_divx(text: &[u8], sep: &[u8]) -> (usize, i32, i32, u8) {
+    let Some((version, rest)) = text.strip_prefix(b"DivX").and_then(scan_int) else {
+        return (0, 0, 0, 0);
+    };
+    let Some((build, rest)) = rest.strip_prefix(sep).and_then(scan_int) else {
+        return (1, version, 0, 0);
+    };
+    match rest.first() {
+        Some(&last) => (3, version, build, last),
+        None => (2, version, build, 0),
+    }
+}
+
+/// FFmpeg's libavcodec build from user data: "FFmpe…b<build>",
+/// "FFmpeg vA.B.C / libavcodec build: <build>", "LavcA.B.C" (packed into
+/// one number) or "ffmpeg" (4600).
+fn scan_lavc(text: &[u8]) -> Option<i32> {
+    // "FFmpe%*[^b]b%d": at least one byte other than 'b' before the 'b'.
+    if let Some(rest) = text.strip_prefix(b"FFmpe") {
+        let skipped = rest.iter().take_while(|&&c| c != b'b').count();
+        if skipped > 0 {
+            if let Some((build, _)) = rest.get(skipped + 1..).and_then(scan_int) {
+                return Some(build);
+            }
+        }
+    }
+    // "FFmpeg v%d.%d.%d / libavcodec build: %d": a space in the format
+    // matches any run of whitespace.
+    let literal = |s: &[u8], lit: &[u8]| -> Option<usize> {
+        let mut at = 0;
+        for &c in lit {
+            if c == b' ' {
+                at += s[at..].iter().take_while(|c| c.is_ascii_whitespace()).count();
+            } else if s.get(at) == Some(&c) {
+                at += 1;
+            } else {
+                return None;
+            }
+        }
+        Some(at)
+    };
+    let full = text.strip_prefix(b"FFmpeg v").and_then(|s| {
+        let (_, s) = scan_int(s)?;
+        let (_, s) = scan_int(s.strip_prefix(b".")?)?;
+        let (_, s) = scan_int(s.strip_prefix(b".")?)?;
+        let (build, _) = scan_int(&s[literal(s, b" / libavcodec build: ")?..])?;
+        Some(build)
+    });
+    if full.is_some() {
+        return full;
+    }
+    // "Lavc%d.%d.%d", each part kept to 8 bits.
+    let lavc = text.strip_prefix(b"Lavc").and_then(|s| {
+        let (a, s) = scan_int(s)?;
+        let (b, s) = scan_int(s.strip_prefix(b".")?)?;
+        let (c, _) = scan_int(s.strip_prefix(b".")?)?;
+        Some(((a & 0xFF) << 16) + ((b & 0xFF) << 8) + (c & 0xFF))
+    });
+    if lavc.is_some() {
+        return lavc;
+    }
+    (text == b"ffmpeg").then_some(4600)
 }
 
 /// The short-header picture clock (see
@@ -296,6 +446,63 @@ impl Mpeg4VideoDecoder {
         Ok(out)
     }
 
+    /// One container packet as FFmpeg's decoder takes it (h263dec.c
+    /// ff_h263_decode_frame, ff_mpeg4_parse_picture_header): the units
+    /// up to and including the first VOP, and of the VOPs only that one;
+    /// what follows it is left to the caller (a DivX packed B-VOP).
+    /// Returns the frames that became displayable and, when that VOP was
+    /// decoded to a picture, the byte offset in `data` where its
+    /// macroblock data ended.
+    pub fn decode_packet(
+        &mut self,
+        data: &[u8],
+        container_pts: Option<i64>,
+    ) -> Result<(Vec<DecodedFrame>, Option<usize>), StreamDecodeError> {
+        self.skipped_last_frame = false;
+        let starts = scan_start_codes(data);
+        if self.short_header.is_some() || self.vol.is_none() {
+            let sh = crate::short_header::scan_short_header_pictures(data).first().copied();
+            if self.short_header.is_some() || sh.is_some_and(|sh| starts.first().map_or(true, |&sc| sh < sc)) {
+                return Ok((self.decode_with_pts(data, container_pts)?, None));
+            }
+        }
+        let mut out = Vec::new();
+        for (idx, &start) in starts.iter().enumerate() {
+            let end = starts.get(idx + 1).copied().unwrap_or(data.len());
+            let unit = &data[start..end];
+            if u32::from_be_bytes([unit[0], unit[1], unit[2], unit[3]]) == VOP_START_CODE {
+                let ended = self.decode_vop_unit(unit, container_pts, &mut out)?;
+                return Ok((out, ended.map(|e| start + e)));
+            }
+            self.decode_unit(unit, container_pts, &mut out)?;
+        }
+        Ok((out, None))
+    }
+
+    /// Whether the stream is a DivX packed bitstream (a B-VOP rides in
+    /// the packet of the anchor before it, the next packet holds a
+    /// placeholder), as its user data says.
+    pub fn divx_packed(&self) -> bool {
+        self.encoder.divx_packed
+    }
+
+    /// Whether FFmpeg's flush shows the last picture once more: a
+    /// low-delay stream that ended with a not-coded VOP (h263dec.c).
+    pub fn repeats_last_picture(&self) -> bool {
+        self.low_delay && self.skipped_last_frame
+    }
+
+    /// Drop the pictures and the motion and timing they carry, keeping
+    /// what the headers set (the VOL, the encoder, the time increment
+    /// width), as FFmpeg's flush does: the decoder state for a seek.
+    pub fn reset_pictures(&mut self) {
+        self.sequence = SequenceDecoder::new();
+        self.anchor_motion = None;
+        self.prev_anchor_ticks = None;
+        self.last_anchor_ticks = None;
+        self.skipped_last_frame = false;
+    }
+
     /// Release the final held anchor at end-of-stream (§6.1.3.8).
     pub fn flush(&mut self) -> Vec<DecodedFrame> {
         self.sequence.flush()
@@ -369,7 +576,7 @@ impl Mpeg4VideoDecoder {
                 self.profile_level = parse_visual_object_sequence_header(unit)?;
             }
             VISUAL_OBJECT_SEQUENCE_END_CODE => {}
-            USER_DATA_START_CODE => {}
+            USER_DATA_START_CODE => self.encoder.read_user_data(&unit[4..]),
             VISUAL_OBJECT_START_CODE => {
                 let _ = parse_visual_object_header(unit)?;
             }
@@ -377,7 +584,20 @@ impl Mpeg4VideoDecoder {
                 // A bare video_object_start_code carries only its id.
             }
             VIDEO_OBJECT_LAYER_START_CODE_MIN..=VIDEO_OBJECT_LAYER_START_CODE_MAX => {
-                self.vol = Some(parse_video_object_layer(unit, self.profile_level)?);
+                let vol = parse_video_object_layer(unit, self.profile_level)?;
+                self.time_increment_bits =
+                    usize::from(crate::vop::vop_time_increment_bits(vol.time_increment_resolution));
+                // FFmpeg's low_delay (decode_vol_header): the VOL's own
+                // flag, else, before the first picture, set for the
+                // Simple and Advanced Simple object types.
+                match vol.vol_control {
+                    Some(control) => self.low_delay = control.low_delay,
+                    None if self.pictures == 0 => {
+                        self.low_delay = matches!(vol.video_object_type_indication, 1 | 17);
+                    }
+                    None => {}
+                }
+                self.vol = Some(vol);
             }
             GROUP_OF_VOP_START_CODE => {
                 let gov = parse_group_of_vop_header(unit)?;
@@ -400,25 +620,38 @@ impl Mpeg4VideoDecoder {
         Ok(())
     }
 
-    /// Decode one `video_object_plane` unit end-to-end.
+    /// Decode one `video_object_plane` unit, header to pixels: the byte offset
+    /// in `unit` where the macroblock data of a decoded VOP ended, `None`
+    /// when no picture was decoded.
     fn decode_vop_unit(
         &mut self,
         unit: &[u8],
         container_pts: Option<i64>,
         out: &mut Vec<DecodedFrame>,
-    ) -> Result<(), StreamDecodeError> {
+    ) -> Result<Option<usize>, StreamDecodeError> {
         let vol = self.vol.ok_or(StreamDecodeError::MissingVol)?;
         let (mb_width, mb_height) = vop_mb_dimensions(&vol);
         let mb_count = mb_width * mb_height;
+        // Ecosystem mode places 8×8 prediction blocks as FFmpeg does
+        // (see `crate::compat`), within this VOL's visible size.
+        self.sequence
+            .set_block_clip(self.options.ecosystem_compat.then(|| visible_size(&vol)));
 
         let mut br = BitReader::new(unit);
         br.skip_bits(32)
             .map_err(|_| StreamDecodeError::Vop(VopParseError::Truncated))?;
-        let vop = parse_vop_header_body(
+        let vop = parse_vop_header_body_tracking(
             &mut br,
             vol.time_increment_resolution,
             VopContext::from_vol(&vol),
+            &mut self.time_increment_bits,
         )?;
+        self.skipped_last_frame = false;
+        // FFmpeg clears low_delay at a B-VOP the VOL did not declare it
+        // for (decode_vop_header).
+        if vop.coding_type == VopCodingType::B && self.low_delay && vol.vol_control.is_none() {
+            self.low_delay = false;
+        }
 
         let res = i64::from(vol.time_increment_resolution.max(1));
         let is_anchor = !matches!(vop.coding_type, VopCodingType::B);
@@ -439,7 +672,18 @@ impl Mpeg4VideoDecoder {
             + i64::from(vop.time_increment);
 
         if !vop.coded {
-            return self.decode_uncoded_vop(
+            if self.options.ecosystem_compat {
+                // FFmpeg decodes no picture for a not-coded VOP
+                // (decode_vop_header returns FRAME_SKIPPED once the
+                // anchor time has moved on); its flush repeats the last
+                // picture of a low-delay stream that ends with one.
+                if is_anchor {
+                    self.advance_anchor_time(&vop, res);
+                }
+                self.skipped_last_frame = true;
+                return Ok(None);
+            }
+            self.decode_uncoded_vop(
                 &vop,
                 mb_count,
                 mb_width,
@@ -447,8 +691,21 @@ impl Mpeg4VideoDecoder {
                 res,
                 (container_pts, vop_ticks),
                 out,
-            );
+            )?;
+            return Ok(None);
         }
+        // The end of FFmpeg's decode_vop_header: a stream whose VOL
+        // declares neither an object type nor control parameters, from
+        // no DivX encoder, is taken as low-delay at its first picture.
+        self.encoder.settle();
+        if vol.video_object_type_indication == 0
+            && vol.vol_control.is_none()
+            && self.encoder.divx_version.is_none()
+            && self.pictures == 0
+        {
+            self.low_delay = true;
+        }
+        self.pictures += 1;
 
         match vop.coding_type {
             VopCodingType::I => {
@@ -530,7 +787,18 @@ impl Mpeg4VideoDecoder {
                 )?);
             }
             VopCodingType::B => {
-                let (trb, trd) = self.b_vop_temporal_refs(&vop, res)?;
+                let (trb, trd) = match self.b_vop_temporal_refs(&vop, res) {
+                    Ok(refs) => refs,
+                    // FFmpeg decodes no picture for a B-VOP without a
+                    // past anchor or with times out of order (h263dec.c
+                    // ff_h263_decode_frame, decode_vop_header).
+                    Err(StreamDecodeError::MissingAnchor | StreamDecodeError::BadTemporalReference { .. })
+                        if self.options.ecosystem_compat =>
+                    {
+                        return Ok(None);
+                    }
+                    Err(e) => return Err(e),
+                };
                 if vol.interlaced {
                     let entries = decode_b_vop_interlaced_macroblocks(
                         &mut br,
@@ -595,7 +863,7 @@ impl Mpeg4VideoDecoder {
         } else if let Some(frame) = out.last_mut() {
             stamp(frame, container_pts, vop_ticks, visible_size(&vol));
         }
-        Ok(())
+        Ok(Some(br.bit_position() / 8))
     }
 
     /// §6.3.5 `vop_coded == 0`: the reconstructed VOP is a copy of the
@@ -842,8 +1110,21 @@ pub struct Mpeg4PacketDecoder {
     /// `max_pixels_per_frame` DoS cap from `CodecParameters::limits`.
     max_pixels: u64,
     flushed: bool,
-    /// The visible size of the frame `receive_frame` last returned.
-    last_output: Option<(u32, u32)>,
+    /// The visible size and pixel format of the frame `receive_frame`
+    /// last returned.
+    last_output: Option<((u32, u32), oxideav_core::PixelFormat)>,
+    /// FFmpeg's buffered packed B-VOP (mpeg4videodec.c bitstream_buffer):
+    /// the rest of a DivX packed-bitstream packet after the VOP decoded
+    /// from it, when that rest starts with a B-VOP.
+    packed: Vec<u8>,
+    /// The pts of the last packet, which FFmpeg's flush gives a repeated
+    /// last picture.
+    last_pts: Option<i64>,
+    /// The Simple Studio Profile decoder, once the stream turned out to
+    /// be one (FFmpeg decodes it in the same decoder).
+    studio: Option<crate::studio::StudioDecoder>,
+    /// Studio pictures not yet handed out.
+    studio_ready: std::collections::VecDeque<crate::studio::StudioFrame>,
 }
 
 impl std::fmt::Debug for Mpeg4PacketDecoder {
@@ -864,16 +1145,37 @@ fn to_core_error(e: StreamDecodeError) -> oxideav_core::Error {
 impl Mpeg4PacketDecoder {
     /// Enforce the `max_pixels_per_frame` cap once a VOL is known.
     fn check_limits(&self) -> oxideav_core::Result<()> {
-        if let Some(vol) = self.inner.vol() {
-            let pixels = u64::from(vol.width) * u64::from(vol.height);
-            if pixels > self.max_pixels {
+        let size = match &self.studio {
+            Some(studio) => studio.layout().map(|(size, _)| size),
+            None => self.inner.vol().map(|vol| (u32::from(vol.width), u32::from(vol.height))),
+        };
+        if let Some((width, height)) = size {
+            if u64::from(width) * u64::from(height) > self.max_pixels {
                 return Err(oxideav_core::Error::resource_exhausted(format!(
-                    "mpeg4video: {}x{} exceeds max_pixels_per_frame {}",
-                    vol.width, vol.height, self.max_pixels
+                    "mpeg4video: {width}x{height} exceeds max_pixels_per_frame {}",
+                    self.max_pixels
                 )));
             }
         }
         Ok(())
+    }
+
+    /// A studio picture as the framework's 10-bit planar
+    /// [`VideoFrame`](oxideav_core::VideoFrame): little-endian samples,
+    /// planes in the pixel format's order.
+    fn studio_to_video(frame: &crate::studio::StudioFrame) -> oxideav_core::VideoFrame {
+        oxideav_core::VideoFrame {
+            pts: frame.pts,
+            planes: frame
+                .planes
+                .iter()
+                .zip(frame.plane_widths)
+                .map(|(plane, width)| oxideav_core::VideoPlane {
+                    stride: width * 2,
+                    data: plane.iter().flat_map(|s| s.to_le_bytes()).collect(),
+                })
+                .collect(),
+        }
     }
 
     /// Convert one decoded VOP into the framework's planar 4:2:0
@@ -914,14 +1216,22 @@ impl Mpeg4PacketDecoder {
         ))
     }
 
-    /// The size `output_video_dimensions` reports: the frame last
-    /// returned; before the first, the next frame in display order (a
-    /// queued frame, then the held anchor), then the active VOL.
-    fn reported_size(&self) -> Option<(u32, u32)> {
+    /// The size and format `output_video_dimensions` and
+    /// `output_pixel_format` report: the frame last returned; before the
+    /// first, the next frame in display order (a queued frame, then the
+    /// held anchor), then the active VOL.
+    fn reported_layout(&self) -> Option<((u32, u32), oxideav_core::PixelFormat)> {
+        if let Some(studio) = &self.studio {
+            return self
+                .last_output
+                .or_else(|| self.studio_ready.front().map(|f| ((f.width, f.height), f.pixel_format)))
+                .or_else(|| studio.layout());
+        }
+        let yuv420 = |size| (size, oxideav_core::PixelFormat::Yuv420P);
         self.last_output
-            .or_else(|| self.ready.front().map(Self::frame_size))
-            .or_else(|| self.inner.sequence.pending_anchor().map(Self::frame_size))
-            .or_else(|| self.inner.vol().map(visible_size))
+            .or_else(|| self.ready.front().map(Self::frame_size).map(yuv420))
+            .or_else(|| self.inner.sequence.pending_anchor().map(Self::frame_size).map(yuv420))
+            .or_else(|| self.inner.vol().map(visible_size).map(yuv420))
     }
 }
 
@@ -930,20 +1240,76 @@ impl oxideav_core::Decoder for Mpeg4PacketDecoder {
         &self.codec_id
     }
 
+    /// In ecosystem-compat mode a packet decodes as FFmpeg's decoder
+    /// takes one: its first VOP only, not-coded VOPs and B-VOPs FFmpeg
+    /// cannot place give no picture, and a DivX packed bitstream's
+    /// B-VOP is kept for the next packet (mpeg4videodec.c
+    /// mpeg4_decode_picture_header, ff_mpeg4_frame_end). Otherwise
+    /// every unit of the packet is decoded.
     fn send_packet(&mut self, packet: &oxideav_core::Packet) -> oxideav_core::Result<()> {
-        let frames = self
+        // A Simple Studio Profile stream decodes on its own path.
+        if self.studio.is_none() && crate::studio::starts_studio(&packet.data) {
+            self.studio = Some(crate::studio::StudioDecoder::default());
+        }
+        if let Some(studio) = self.studio.as_mut() {
+            let frames = studio.decode_packet(&packet.data, packet.pts).map_err(to_core_error)?;
+            self.check_limits()?;
+            self.studio_ready.extend(frames);
+            return Ok(());
+        }
+        if !self.inner.options().ecosystem_compat {
+            let frames = self
+                .inner
+                .decode_with_pts(&packet.data, packet.pts)
+                .map_err(to_core_error)?;
+            self.check_limits()?;
+            self.ready.extend(frames);
+            return Ok(());
+        }
+        let data = &packet.data[..];
+        self.last_pts = packet.pts;
+        // The B-VOP a packed packet left is decoded in place of this
+        // packet (its placeholder), unless this packet starts a new
+        // visual object sequence.
+        let mut packed = std::mem::take(&mut self.packed);
+        let starts_sequence = scan_start_codes(data)
+            .first()
+            .is_some_and(|&i| u32::from_be_bytes([0, 0, 1, data[i + 3]]) == VISUAL_OBJECT_SEQUENCE_START_CODE);
+        if self.inner.divx_packed() && starts_sequence {
+            packed.clear();
+        }
+        let from_packed = !packed.is_empty() && (self.inner.divx_packed() || data.len() <= MAX_NVOP_SIZE);
+        let source = if from_packed { &packed[..] } else { data };
+        let (frames, ended) = self
             .inner
-            .decode_with_pts(&packet.data, packet.pts)
+            .decode_packet(source, packet.pts)
             .map_err(to_core_error)?;
         self.check_limits()?;
         self.ready.extend(frames);
+        // After a picture of a packed bitstream, the rest of this packet
+        // from where the picture's data ended (from its start when the
+        // picture came from the kept bytes) is kept when its first VOP
+        // is a B-VOP.
+        if let (true, Some(end)) = (self.inner.divx_packed(), ended) {
+            let from = if from_packed { 0 } else { end };
+            if data.len().saturating_sub(from) > 7 {
+                let next_vop = (from..data.len() - 4).find(|&i| data[i..i + 4] == [0, 0, 1, 0xB6]);
+                if next_vop.is_some_and(|i| data[i + 4] & 0x40 == 0) {
+                    self.packed = data[from..].to_vec();
+                }
+            }
+        }
         Ok(())
     }
 
     fn receive_frame(&mut self) -> oxideav_core::Result<oxideav_core::Frame> {
+        if let Some(frame) = self.studio_ready.pop_front() {
+            self.last_output = Some(((frame.width, frame.height), frame.pixel_format));
+            return Ok(oxideav_core::Frame::Video(Self::studio_to_video(&frame)));
+        }
         match self.ready.pop_front() {
             Some(frame) => {
-                self.last_output = Some(Self::frame_size(&frame));
+                self.last_output = Some((Self::frame_size(&frame), oxideav_core::PixelFormat::Yuv420P));
                 Ok(oxideav_core::Frame::Video(Self::frame_to_video(&frame)))
             }
             None if self.flushed => Err(oxideav_core::Error::Eof),
@@ -952,27 +1318,55 @@ impl oxideav_core::Decoder for Mpeg4PacketDecoder {
     }
 
     fn output_video_dimensions(&self) -> Option<(u32, u32)> {
-        self.reported_size()
+        self.reported_layout().map(|(size, _)| size)
     }
 
-    /// Every frame is planar 4:2:0 at 8 bits (§6.1.3.4).
+    /// Planar 4:2:0 at 8 bits (§6.1.3.4); 10-bit 4:2:2, 4:4:4 or RGB for
+    /// the Simple Studio Profile.
     fn output_pixel_format(&self) -> Option<oxideav_core::PixelFormat> {
-        self.reported_size()
-            .map(|_| oxideav_core::PixelFormat::Yuv420P)
+        self.reported_layout().map(|(_, format)| format)
     }
 
     fn flush(&mut self) -> oxideav_core::Result<()> {
+        // A low-delay stream that ended with a not-coded VOP shows its
+        // last picture once more, with the last packet's pts (h263dec.c
+        // ff_h263_decode_frame at the end of the stream).
+        let repeat = self
+            .inner
+            .repeats_last_picture()
+            .then(|| self.inner.sequence.pending_anchor().cloned())
+            .flatten();
         self.ready.extend(self.inner.flush());
+        if let Some(studio) = self.studio.as_mut() {
+            self.studio_ready.extend(studio.flush());
+        }
+        if let Some(mut frame) = repeat {
+            frame.set_pts(self.last_pts);
+            self.ready.push_back(frame);
+        }
         self.flushed = true;
         Ok(())
     }
 
     fn reset(&mut self) -> oxideav_core::Result<()> {
-        // Preserve the compat behaviour selection across seeks.
-        self.inner = Mpeg4VideoDecoder::with_options(self.inner.options());
         self.ready.clear();
+        self.studio_ready.clear();
+        if let Some(studio) = self.studio.as_mut() {
+            // The held picture is dropped; the headers stay.
+            let _ = studio.flush();
+        }
         self.flushed = false;
         self.last_output = None;
+        self.packed.clear();
+        self.last_pts = None;
+        if self.inner.options().ecosystem_compat {
+            // FFmpeg's flush keeps what the headers set: in-band
+            // headers before the seek point stay in force.
+            self.inner.reset_pictures();
+            return Ok(());
+        }
+        // Preserve the compat behaviour selection across seeks.
+        self.inner = Mpeg4VideoDecoder::with_options(self.inner.options());
         if !self.extradata.is_empty() {
             // Re-prime the configuration headers so the next packet
             // decodes against the same VOL.
@@ -989,20 +1383,32 @@ impl oxideav_core::Decoder for Mpeg4PacketDecoder {
 ///
 /// One key is recognised:
 ///
-/// * `ecosystem-compat` (bool, default `false`) — decode with the
-///   ecosystem-compat behaviour on the two documented spec
-///   divergences (see [`crate::compat`]): the §7.7.2.2
-///   interlaced-direct derivation reads the co-located field MVs as
-///   zero, and the §7.4.4.5 method-1 mismatch toggle is skipped on
-///   intra blocks. The default is the literal spec text.
+/// * `ecosystem-compat` (bool, default `true`) — decode as FFmpeg does
+///   where it departs from the spec text (see [`crate::compat`]): the
+///   §7.7.2.2 interlaced-direct derivation reads the co-located field
+///   MVs as zero, the §7.4.4.5 method-1 mismatch toggle is skipped on
+///   intra blocks, GMC averaged vectors are derived FFmpeg's way, 8×8
+///   prediction blocks are placed within the visible area, and packets
+///   decode as FFmpeg's decoder takes them (first VOP only, no picture
+///   for not-coded VOPs, DivX packed B-frames). `false` selects the
+///   literal spec text.
 ///
 /// Typed consumers can skip the bag and pass
 /// [`DecodeOptions`](crate::compat::DecodeOptions) to
 /// [`Mpeg4VideoDecoder::with_options`] directly.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Mpeg4DecoderOptions {
     /// The [`crate::compat`] ecosystem-compat switch.
     pub ecosystem_compat: bool,
+}
+
+impl Default for Mpeg4DecoderOptions {
+    /// The registry decoder decodes as FFmpeg does.
+    fn default() -> Self {
+        Self {
+            ecosystem_compat: true,
+        }
+    }
 }
 
 impl From<Mpeg4DecoderOptions> for DecodeOptions {
@@ -1017,11 +1423,11 @@ impl oxideav_core::CodecOptionsStruct for Mpeg4DecoderOptions {
     const SCHEMA: &'static [oxideav_core::OptionField] = &[oxideav_core::OptionField {
         name: "ecosystem-compat",
         kind: oxideav_core::OptionKind::Bool,
-        default: oxideav_core::OptionValue::Bool(false),
-        help: "match the black-box-observed ecosystem behaviour on the two documented \
-               ISO/IEC 14496-2 divergences (interlaced-direct co-located MVs read as zero; \
-               §7.4.4.5 mismatch control skipped on intra blocks) instead of the literal \
-               spec text",
+        default: oxideav_core::OptionValue::Bool(true),
+        help: "decode as FFmpeg does where it departs from the ISO/IEC 14496-2 text \
+               (interlaced-direct co-located MVs read as zero; §7.4.4.5 mismatch control \
+               skipped on intra blocks; GMC averaged vectors; 8x8 blocks placed within the \
+               visible area; FFmpeg's packet handling) instead of the literal spec text",
     }];
 
     fn apply(&mut self, key: &str, value: &oxideav_core::OptionValue) -> oxideav_core::Result<()> {
@@ -1054,14 +1460,27 @@ pub fn make_decoder(
         max_pixels: params.limits.max_pixels_per_frame,
         flushed: false,
         last_output: None,
+        packed: Vec::new(),
+        last_pts: None,
+        studio: None,
+        studio_ready: std::collections::VecDeque::new(),
     };
-    if !dec.extradata.is_empty() {
+    if crate::studio::starts_studio(&params.extradata) {
+        let mut studio = crate::studio::StudioDecoder::default();
+        studio.decode_packet(&params.extradata, None).map_err(to_core_error)?;
+        dec.studio = Some(studio);
+        dec.check_limits()?;
+    } else if !dec.extradata.is_empty() {
         let frames = dec.inner.decode(&params.extradata).map_err(to_core_error)?;
         dec.check_limits()?;
         dec.ready.extend(frames);
     }
     Ok(Box::new(dec))
 }
+
+/// FFmpeg's MAX_NVOP_SIZE (mpeg4videodec.h): a packet this small may be
+/// the placeholder of a packed B-VOP.
+const MAX_NVOP_SIZE: usize = 19;
 
 /// Return the byte offsets of every `00 00 01 xx` start code in `data`
 /// (the offset of the leading `00`).
@@ -1531,6 +1950,22 @@ mod registry_tests {
         Packet::new(0, TimeBase::new(1, 30), data)
     }
 
+    /// `stream` cut as FFmpeg's mpeg4video parser cuts it: each VOP with
+    /// the headers before it.
+    fn parser_frames(stream: &[u8]) -> Vec<Vec<u8>> {
+        let starts = scan_start_codes(stream);
+        let mut frames = Vec::new();
+        let mut from = 0;
+        for (k, &at) in starts.iter().enumerate() {
+            if stream[at + 3] == 0xB6 {
+                let end = starts.get(k + 1).copied().unwrap_or(stream.len());
+                frames.push(stream[from..end].to_vec());
+                from = end;
+            }
+        }
+        frames
+    }
+
     #[test]
     fn registry_round_trip_decodes_display_order_frames() {
         // Register into a fresh RuntimeContext, resolve by id, then
@@ -1631,18 +2066,18 @@ mod registry_tests {
 
     #[test]
     fn decoder_options_bag_parses_ecosystem_compat() {
-        // Empty bag → spec defaults.
+        // Empty bag → FFmpeg's behaviour.
         let d: Mpeg4DecoderOptions =
             oxideav_core::parse_options(&oxideav_core::CodecOptions::new()).unwrap();
-        assert!(!d.ecosystem_compat);
-        assert_eq!(DecodeOptions::from(d), DecodeOptions::spec());
-        // Bool synonyms coerce.
-        let d: Mpeg4DecoderOptions = oxideav_core::parse_options(
-            &oxideav_core::CodecOptions::new().set("ecosystem-compat", "on"),
-        )
-        .unwrap();
         assert!(d.ecosystem_compat);
         assert_eq!(DecodeOptions::from(d), DecodeOptions::ecosystem());
+        // Bool synonyms coerce.
+        let d: Mpeg4DecoderOptions = oxideav_core::parse_options(
+            &oxideav_core::CodecOptions::new().set("ecosystem-compat", "off"),
+        )
+        .unwrap();
+        assert!(!d.ecosystem_compat);
+        assert_eq!(DecodeOptions::from(d), DecodeOptions::spec());
     }
 
     #[test]
@@ -1707,11 +2142,12 @@ mod registry_tests {
         .unwrap();
         let run = |compat: bool| {
             let mut params = CodecParameters::video(CodecId::new("mpeg4video"));
-            if compat {
-                params.options = oxideav_core::CodecOptions::new().set("ecosystem-compat", "true");
-            }
+            params.options = oxideav_core::CodecOptions::new()
+                .set("ecosystem-compat", if compat { "true" } else { "false" });
             let mut dec = make_decoder(&params).unwrap();
-            dec.send_packet(&packet(stream.clone())).unwrap();
+            for frame in parser_frames(&stream) {
+                dec.send_packet(&packet(frame)).unwrap();
+            }
             dec.flush().unwrap();
             let mut planes = Vec::new();
             while let Ok(oxideav_core::Frame::Video(v)) = dec.receive_frame() {

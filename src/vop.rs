@@ -452,7 +452,8 @@ pub fn parse_video_object_plane_header(
             found: sc,
         });
     }
-    parse_video_object_plane_body(&mut br, resolution, ctx)
+    let mut bits = usize::from(vop_time_increment_bits(resolution));
+    parse_video_object_plane_body(&mut br, resolution, ctx, &mut bits)
 }
 
 /// Parse a §6.2.5 VOP header **body** (everything after the 32-bit
@@ -471,13 +472,38 @@ pub fn parse_vop_header_body(
     resolution: u16,
     ctx: VopContext,
 ) -> Result<VopHeader, VopParseError> {
-    parse_video_object_plane_body(br, resolution, ctx)
+    let mut bits = usize::from(vop_time_increment_bits(resolution));
+    parse_video_object_plane_body(br, resolution, ctx, &mut bits)
+}
+
+/// [`parse_vop_header_body`] with the `vop_time_increment` width a
+/// stream decoder carries from VOP to VOP, as FFmpeg's does
+/// (mpeg4videodec.c, decode_vol_header and decode_vop_header): `bits`
+/// starts at the width each VOL declares; a VOP whose bit after the
+/// increment is not the marker gets a width derived from the bits
+/// that follow, and that width holds for the VOPs after it.
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
+pub fn parse_vop_header_body_tracking(
+    br: &mut BitReader<'_>,
+    resolution: u16,
+    ctx: VopContext,
+    bits: &mut usize,
+) -> Result<VopHeader, VopParseError> {
+    parse_video_object_plane_body(br, resolution, ctx, bits)
+}
+
+/// FFmpeg's show_bits: the next `n` bits, zeros past the end.
+fn show_bits_padded(br: &BitReader<'_>, n: usize) -> u32 {
+    let have = br.remaining_bits().min(n);
+    let v = if have == 0 { 0 } else { br.next_bits(have).unwrap_or(0) };
+    v << (n - have)
 }
 
 fn parse_video_object_plane_body(
     br: &mut BitReader<'_>,
     resolution: u16,
     ctx: VopContext,
+    bits: &mut usize,
 ) -> Result<VopHeader, VopParseError> {
     if !(3..=9).contains(&ctx.quant_precision) {
         return Err(VopParseError::BadQuantPrecision(ctx.quant_precision));
@@ -505,38 +531,27 @@ fn parse_video_object_plane_body(
     // streams (FATE demo.m4v) rely on that leniency, so the marker is
     // consumed but not validated here.
     let _before_tinc = br.read_bool()?;
-    let mut bits = vop_time_increment_bits(resolution) as usize;
-    // FFmpeg's workaround for a missing/misaligned VOL header: if the
-    // bit right after time_increment is not the vop_coded marker, the
-    // coded width is wrong — re-derive it from bitstream analysis. The
-    // expected post-tinc bit patterns differ per coding type (P/S-VOPs
-    // carry fcode bits between vop_coded and quant).
-    let is_p_like = matches!(
-        coding_type,
-        VopCodingType::P | VopCodingType::S
-    );
-    let after_tinc = br.next_bits((bits + 1).min(br.remaining_bits().max(1)))? & 1;
-    if after_tinc == 0 {
-        // Mirrored from FFmpeg mpeg4videodec.c: scan for the width whose
-        // following bits look like a valid vop_coded + shape payload.
-        let heuristic_bits = (1usize..16).find(|&b| {
-            let window = br.remaining_bits();
-            let want = if is_p_like { b + 6 } else { b + 5 };
-            if window < want {
-                return false;
-            }
-            let v = br.next_bits(want).unwrap_or(0);
-            if is_p_like {
-                (v & 0x37) == 0x30
-            } else {
-                (v & 0x1F) == 0x18
-            }
-        });
-        if let Some(b) = heuristic_bits {
-            bits = b;
-        }
+    // FFmpeg's workaround for a missing or wrong VOL header
+    // (decode_vop_header): when the bit after `bits` of increment is not
+    // the marker, the width becomes the first one, from 1 up, whose
+    // following bits look like marker, vop_coded = 1 and an
+    // intra_dc_vlc_thr starting with zeros (P- and GMC S-VOPs carry
+    // vop_rounding_type in between), or 16 when none does. The caller
+    // keeps the new width for the VOPs after this one.
+    if *bits == 0 || show_bits_padded(br, *bits + 1) & 1 == 0 {
+        let p_like = matches!(coding_type, VopCodingType::P)
+            || (matches!(coding_type, VopCodingType::S) && ctx.sprite_gmc);
+        *bits = (1usize..16)
+            .find(|&b| {
+                if p_like {
+                    show_bits_padded(br, b + 6) & 0x37 == 0x30
+                } else {
+                    show_bits_padded(br, b + 5) & 0x1F == 0x18
+                }
+            })
+            .unwrap_or(16);
     }
-    let time_increment = br.read_bits(bits)? as u16;
+    let time_increment = br.read_bits(*bits)? as u16;
     let _before_coded = br.read_bool()?;
     let coded = br.read_bool()?;
 

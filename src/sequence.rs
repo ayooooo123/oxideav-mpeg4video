@@ -55,6 +55,10 @@ pub struct SequenceDecoder {
     /// for display (held back by the §6.1.3.8 one-slot delay). `None`
     /// before the first anchor and immediately after a flush.
     pending_anchor: Option<DecodedFrame>,
+    /// The visible size within which prediction from the anchors pushed
+    /// next places 8×8 blocks as FFmpeg does
+    /// ([`DecodedFrame::set_block_clip`]); `None` for the spec placement.
+    block_clip: Option<(u32, u32)>,
 }
 
 impl SequenceDecoder {
@@ -68,6 +72,14 @@ impl SequenceDecoder {
     #[inline]
     pub fn store(&self) -> &FrameStore {
         &self.store
+    }
+
+    /// Place 8×8 prediction blocks within `clip` (a visible size), as
+    /// FFmpeg does, in predictions from the anchors pushed from now on;
+    /// `None` places them where their vectors point.
+    #[inline]
+    pub fn set_block_clip(&mut self, clip: Option<(u32, u32)>) {
+        self.block_clip = clip;
     }
 
     /// Decode an I-VOP (intra-only, supplied already reconstructed) in
@@ -250,7 +262,10 @@ impl SequenceDecoder {
     /// Common anchor-handling: the new anchor displaces the held one
     /// (which becomes displayable) and is itself pushed into the chain as
     /// the new reference *and* held back for the §6.1.3.8 one-slot delay.
-    fn accept_anchor(&mut self, frame: DecodedFrame) -> Vec<DecodedFrame> {
+    fn accept_anchor(&mut self, mut frame: DecodedFrame) -> Vec<DecodedFrame> {
+        if let Some(clip) = self.block_clip {
+            frame.set_block_clip(clip);
+        }
         // Push into the reference chain so subsequent VOPs can reference
         // it (this is decode-order state, independent of display delay).
         self.store.push_anchor(frame.clone());

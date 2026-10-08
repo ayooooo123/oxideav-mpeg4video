@@ -756,10 +756,44 @@ pub fn predict_b_vop_macroblock(
         InterPredictionMacroblock, MACROBLOCK_CHROMA_SIDE, MACROBLOCK_LUMA_SIDE,
     };
 
+    // FFmpeg compensates a direct macroblock as four 8×8 blocks (and its
+    // chroma as a four-vector macroblock's) when the co-located
+    // macroblock had four vectors or the VOL is quarter-sample
+    // (mpeg4video.c ff_mpeg4_set_direct_mv), else as one 16×16 block;
+    // only 8×8 blocks are placed within the visible area (see
+    // `ReferenceVop::block_vector`). At half-sample accuracy four equal
+    // pairs stand for a single co-located vector.
+    let blocks_8x8 = prediction_mode == BVopPredictionMode::Direct
+        && (matches!(mode, BVopSampleMode::QuarterPel { .. }) || mvs.iter().any(|p| *p != mvs[0]));
+    let (mvs, forward_chroma_mv, backward_chroma_mv) = if blocks_8x8 {
+        let frac_bits = match mode {
+            BVopSampleMode::HalfPel => 1,
+            BVopSampleMode::QuarterPel { .. } => 2,
+        };
+        let place = |reference: &ReferenceVop<'_>, mv: MotionVector, origin: (i32, i32), frac: u32, guard: i32| {
+            let (x, y) = reference.block_vector((mv.x, mv.y), origin, frac, guard);
+            MotionVector { x, y }
+        };
+        let mut placed = *mvs;
+        for (pair, &(dx, dy)) in placed.iter_mut().zip(SUB_BLOCK_OFFSETS.iter()) {
+            let origin = (mb_origin_x + dx, mb_origin_y + dy);
+            pair.forward = place(forward_ref, pair.forward, origin, frac_bits, 16);
+            pair.backward = place(backward_ref, pair.backward, origin, frac_bits, 16);
+        }
+        let chroma_origin = (mb_origin_x / 2, mb_origin_y / 2);
+        (
+            placed,
+            place(forward_cb_ref, forward_chroma_mv, chroma_origin, 1, 8),
+            place(backward_cb_ref, backward_chroma_mv, chroma_origin, 1, 8),
+        )
+    } else {
+        (*mvs, forward_chroma_mv, backward_chroma_mv)
+    };
+
     let luma_flat = generate_b_vop_luma_prediction(
         forward_ref,
         backward_ref,
-        mvs,
+        &mvs,
         mb_origin_x,
         mb_origin_y,
         vop_rounding_type,

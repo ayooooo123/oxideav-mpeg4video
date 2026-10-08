@@ -525,12 +525,17 @@ pub fn predict_luma_macroblock(
         PvopMbMotion::FourMv(mvs) => {
             let mut out = vec![0u8; 256];
             let mut tile = vec![0u8; 64];
+            let frac_bits = match mode {
+                crate::bvop_prediction::BVopSampleMode::HalfPel => 1,
+                crate::bvop_prediction::BVopSampleMode::QuarterPel { .. } => 2,
+            };
             for (i, mv) in mvs.iter().enumerate() {
                 let bx = mb_x + 8 * (i as i32 & 1);
                 let by = mb_y + 8 * (i as i32 >> 1);
+                let (x, y) = reference.block_vector((mv.x, mv.y), (bx, by), frac_bits, 16);
                 interpolate_luma_block_into(
                     reference,
-                    *mv,
+                    MotionVector { x, y },
                     bx,
                     by,
                     8,
@@ -614,7 +619,13 @@ pub fn predict_chroma_macroblock(
     vop_rounding_type: u8,
     mode: crate::bvop_prediction::BVopSampleMode,
 ) -> Option<Vec<u8>> {
-    let mv = chroma_mv_for_macroblock(motion, mode)?;
+    let mut mv = chroma_mv_for_macroblock(motion, mode)?;
+    if let PvopMbMotion::FourMv(_) = motion {
+        // FFmpeg's chroma_4mv_motion places the 8×8 chroma block of a
+        // four-vector macroblock like a luminance 8×8 block.
+        let (x, y) = reference.block_vector((mv.x, mv.y), (cmb_x, cmb_y), 1, 8);
+        mv = MotionVector { x, y };
+    }
     Some(crate::half_sample::interpolate_block(
         reference,
         mv.x,

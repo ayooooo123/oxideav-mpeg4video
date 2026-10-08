@@ -20,6 +20,13 @@ fn decoder() -> Box<dyn Decoder> {
     oxideav_mpeg4video::make_decoder(&CodecParameters::video("mpeg4video".into())).expect("decoder")
 }
 
+/// The literal-spec decoder, which decodes every unit of a packet.
+fn literal_decoder() -> Box<dyn Decoder> {
+    let mut params = CodecParameters::video("mpeg4video".into());
+    params.options = oxideav_core::CodecOptions::new().set("ecosystem-compat", "false");
+    oxideav_mpeg4video::make_decoder(&params).expect("decoder")
+}
+
 fn report(dec: &dyn Decoder) -> Option<(u32, u32, PixelFormat)> {
     let (w, h) = dec.output_video_dimensions()?;
     Some((w, h, dec.output_pixel_format()?))
@@ -63,15 +70,16 @@ fn receive_all(dec: &mut dyn Decoder, expected: &[(u32, u32)], seen: &mut usize)
     }
 }
 
-/// Three VOLs of different sizes in one packet: every VOL is parsed
-/// before the first frame comes out.
+/// Three VOLs of different sizes in one packet, in literal-spec mode,
+/// which decodes every unit of a packet: every VOL is parsed before the
+/// first frame comes out.
 #[test]
 fn each_frame_reports_its_own_vol_size() {
     let expected: Vec<(u32, u32)> = [(33, 17), (48, 32), (35, 19)]
         .iter()
         .flat_map(|&size| std::iter::repeat(size).take(4))
         .collect();
-    let mut dec = decoder();
+    let mut dec = literal_decoder();
     dec.send_packet(&Packet::new(0, TimeBase::new(1, 25), [A, B, C].concat()))
         .expect("send");
     assert_eq!(

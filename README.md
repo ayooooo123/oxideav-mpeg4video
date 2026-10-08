@@ -266,13 +266,12 @@ direct-API two-pass round trip.
 ## Compatibility modes
 
 The decoder's default behaviour is always the **literal ISO/IEC
-14496-2 text**. For three clauses, black-box pixel comparison against
-reference decodes of conformant streams shows the deployed decoder
-ecosystem behaves differently (no implementation source was consulted
-— outputs only). The opt-in **ecosystem-compat** mode reproduces the
-observed behaviour bit-for-bit so real-world files can be matched
-exactly; it covers exactly these three divergences (`crate::compat`
-module docs carry the full write-up):
+14496-2 text**. For the clauses below, reference decodes (FFmpeg) of
+conformant streams behave differently. The **ecosystem-compat** mode
+reproduces that behaviour bit-for-bit so real-world files can be
+matched exactly; the registry decoder (`make_decoder`) uses it by
+default. It covers exactly these divergences (`crate::compat` module
+docs carry the full write-up):
 
 1. **§7.7.2.2 interlaced direct mode** — spec: the four field MVs are
    derived from the co-located future macroblock's forward field
@@ -292,6 +291,18 @@ module docs carry the full write-up):
    (`tests/compat_gmc_amv.rs`): a full encoder-produced
    negative-trajectory S(GMC) stream decodes **bit-exact** against
    the reference decoder under ecosystem-compat.
+4. **8×8 block placement** — FFmpeg clips the integer source position
+   of an 8×8 prediction block (four-vector macroblocks, and direct
+   macroblocks over a four-vector co-located macroblock or in a
+   quarter-sample VOL) to the visible area, dropping an axis' fraction
+   at its edge; where the picture does not fill its last macroblock
+   row or column this moves the block.
+5. **Packets** — a not-coded VOP gives no picture, nor does a B-VOP
+   without a past anchor or with its times out of order; the registry
+   decoder decodes the first VOP of each packet, keeps the B-VOP of a
+   DivX packed bitstream for the next packet's placeholder, and shows
+   the last picture of a low-delay stream that ends with a not-coded
+   VOP once more.
 
 Selection is wired through every decode surface:
 
@@ -299,9 +310,10 @@ Selection is wired through every decode surface:
   (default `new()` / `DecodeOptions::spec()` is the literal spec);
   every `vop_decode` macroblock walk takes the same `DecodeOptions`;
 * registry / options bag: key **`ecosystem-compat`** (bool, default
-  `false`) on `CodecParameters::options`, declared by the
+  `true`) on `CodecParameters::options`, declared by the
   `Mpeg4DecoderOptions` schema and parsed in `make_decoder`; the
-  selection survives `Decoder::reset`.
+  selection survives `Decoder::reset`, which keeps the headers in force
+  as FFmpeg's flush does.
 
 Measured effect (`tests/conformance.rs` `compat_*` pins): the
 `mpeg_quant` I/P/B stream collapses from a 3062-sample envelope to 4
@@ -580,8 +592,10 @@ both modes' envelopes are pinned).
   is decoding each piece's `sprite_shape_texture()` macroblock body into
   sprite memory (the object-piece I-VOP / update-piece P-VOP macroblock
   texture subset).
-- Scalability enhancement layers, Studio Profile, and non-rectangular
-  shapes (rejected with typed errors). GMC global-motion warping *is*
+- Scalability enhancement layers and non-rectangular shapes (rejected
+  with typed errors). The Simple Studio Profile (10-bit intra VOPs, DCT
+  or DPCM macroblocks) decodes through the registry decoder only
+  (`studio`, an FFmpeg port). GMC global-motion warping *is*
   supported; the §6.3.6 `mcsel` flag is now routed into the §7.3 recon
   loop (`s_gmc_recon::s_gmc_prediction_macroblock` selects warped vs.
   translational per-MB), and the §7.8.7.3 averaged MV predictor and the

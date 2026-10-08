@@ -204,6 +204,9 @@ pub struct ReferenceVop<'a> {
     width: i32,
     height: i32,
     stride: i32,
+    /// The plane's visible size where 8×8 blocks are placed as FFmpeg
+    /// places them (see [`ReferenceVop::block_vector`]).
+    block_clip: Option<(i32, i32)>,
 }
 
 impl<'a> ReferenceVop<'a> {
@@ -251,7 +254,39 @@ impl<'a> ReferenceVop<'a> {
             width: width as i32,
             height: height as i32,
             stride: stride as i32,
+            block_clip: None,
         })
+    }
+
+    /// This plane with 8×8 blocks placed as FFmpeg places them, within
+    /// `visible` (the plane's visible width and height); `None` keeps
+    /// each block where its vector points.
+    pub fn with_block_clip(mut self, visible: Option<(usize, usize)>) -> Self {
+        self.block_clip = visible.map(|(w, h)| (w as i32, h as i32));
+        self
+    }
+
+    /// The vector FFmpeg predicts the 8×8 block at `origin` from, for
+    /// the block's vector `mv` with `frac_bits` fractional bits (1 at
+    /// half-sample, 2 at quarter-sample accuracy). mpegvideo_motion.c
+    /// (hpel_motion, apply_8x8, chroma_4mv_motion) clips the integer
+    /// source position of an 8×8 block to `[-guard, visible width]` ×
+    /// `[-guard, visible height]` (`guard` 16 for luminance, 8 for
+    /// chrominance) and drops an axis' fraction where the clip leaves
+    /// the block at the visible edge. Below a macroblock-aligned edge the
+    /// plane holds decoded samples, so the clip moves such a block. The
+    /// vector is unchanged without a block clip.
+    pub fn block_vector(&self, mv: (i32, i32), origin: (i32, i32), frac_bits: u32, guard: i32) -> (i32, i32) {
+        let Some((visible_w, visible_h)) = self.block_clip else {
+            return mv;
+        };
+        let mask = (1 << frac_bits) - 1;
+        let axis = |v: i32, at: i32, edge: i32| {
+            let src = (at + (v >> frac_bits)).clamp(-guard, edge);
+            let frac = if src == edge { 0 } else { v & mask };
+            ((src - at) << frac_bits) | frac
+        };
+        (axis(mv.0, origin.0, visible_w), axis(mv.1, origin.1, visible_h))
     }
 
     /// Plane width in samples.

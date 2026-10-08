@@ -403,6 +403,8 @@ pub mod sprite; // mixed: `SpriteTrajectoryError` stays visible
 pub mod sprite_piece;
 #[doc(hidden)]
 pub mod static_sprite;
+#[doc(hidden)]
+pub mod studio;
 pub mod svop_encode;
 pub mod texture; // mixed: `TextureParseError` stays visible
 #[doc(hidden)]

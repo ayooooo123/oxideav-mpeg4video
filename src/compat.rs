@@ -2,14 +2,15 @@
 //! deployed decoder ecosystem disagree.
 //!
 //! This crate's default behaviour is always the **literal
-//! specification text**. For three clauses, black-box comparison
-//! against reference decodes of conformant streams (pixel-level output
-//! comparison only — no implementation source was consulted) shows the
-//! deployed ecosystem behaves differently, so real-world streams
-//! produced/consumed by that ecosystem reconstruct slightly
-//! differently from the printed clauses. [`DecodeOptions`] carries the
-//! opt-in **ecosystem-compat** switch that reproduces the observed
-//! behaviour bit-for-bit; it covers exactly these three divergences:
+//! specification text**. For the clauses below, comparison against
+//! reference decodes of conformant streams shows the deployed ecosystem
+//! (FFmpeg) behaves differently, so real-world streams produced and
+//! consumed by that ecosystem reconstruct slightly differently from the
+//! printed clauses. [`DecodeOptions`] carries the opt-in
+//! **ecosystem-compat** switch that reproduces the observed behaviour
+//! bit-for-bit; the registry decoder
+//! ([`crate::decoder::make_decoder`]) turns it on by default. It covers
+//! exactly these divergences:
 //!
 //! 1. **§7.7.2.2 interlaced direct mode.** The spec derives the four
 //!    field motion vectors "from the forward field motion vectors of
@@ -56,6 +57,29 @@
 //!    (−6→−7, −8→−9, −18→−19, −20→−21); pinned bit-exact by the
 //!    `dec_sgmc_*` fixture pairs (`tests/compat_gmc_amv.rs`).
 //!
+//! 4. **8×8 block placement** (FFmpeg mpegvideo_motion.c hpel_motion,
+//!    apply_8x8, chroma_4mv_motion; mpeg4video.c ff_mpeg4_set_direct_mv).
+//!    The integer source position of an 8×8 prediction block (a
+//!    four-vector macroblock's luminance blocks and its chrominance
+//!    block, and a direct-mode macroblock whose co-located macroblock
+//!    had four vectors or whose VOL is quarter-sample) is clipped to
+//!    `[-16, width]` × `[-16, height]` of the visible area (`[-8, width /
+//!    2]` × `[-8, height / 2]` for chrominance), an axis dropping its
+//!    fraction where the clip leaves the block at the visible edge.
+//!    Where the picture does not fill its last macroblock row or column
+//!    the samples there are decoded ones, so the clip moves such a block.
+//!
+//! 5. **Packets** (h263dec.c ff_h263_decode_frame, mpeg4videodec.c
+//!    ff_mpeg4_parse_picture_header, mpeg4_decode_picture_header,
+//!    ff_mpeg4_frame_end). A not-coded VOP gives no picture (its anchor
+//!    time still moves on), and neither does a B-VOP without a past
+//!    anchor or with its times out of order. The registry decoder
+//!    decodes the first VOP of each packet only; in a DivX packed
+//!    bitstream (user data `DivX…p`) a B-VOP after it is kept and
+//!    decoded in place of the next packet's placeholder, and a
+//!    low-delay stream that ends with a not-coded VOP shows its last
+//!    picture once more.
+//!
 //! Everything else decodes identically in both modes. The switch is
 //! wired through every public decode surface: the
 //! [`crate::vop_decode`] macroblock walks take a [`DecodeOptions`]
@@ -72,8 +96,8 @@
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DecodeOptions {
     /// Opt-in ecosystem-compat mode. When `true` the decoder
-    /// reproduces the black-box-observed ecosystem behaviour on
-    /// exactly three clauses:
+    /// reproduces the observed ecosystem (FFmpeg) behaviour on exactly
+    /// these clauses:
     ///
     /// * §7.7.2.2 interlaced-direct derivation runs with the
     ///   co-located field motion vectors read as zero
@@ -83,9 +107,12 @@ pub struct DecodeOptions {
     ///   blocks (non-intra blocks keep it);
     /// * each non-positive §7.8.7.3 GMC averaged-MV component is
     ///   derived one MV-grid unit lower than the spec quantisation
-    ///   (zero included: 0 → −1).
+    ///   (zero included: 0 → −1);
+    /// * 8×8 prediction blocks are placed within the visible area;
+    /// * not-coded VOPs, and B-VOPs FFmpeg cannot place, give no
+    ///   picture.
     ///
-    /// When `false` (the default) all three clauses follow the printed
+    /// When `false` (the default) all of these follow the printed
     /// specification text.
     pub ecosystem_compat: bool,
 }

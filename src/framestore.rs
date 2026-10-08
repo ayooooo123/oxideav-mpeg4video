@@ -88,6 +88,10 @@ pub struct DecodedFrame {
     /// The visible `(width, height)` the stream decoder attached — see
     /// [`DecodedFrame::visible_size`].
     visible: Option<(u32, u32)>,
+    /// The visible size within which 8×8 prediction blocks read from
+    /// this frame are placed as FFmpeg places them; `None` places them
+    /// where their vectors point.
+    block_clip: Option<(u32, u32)>,
 }
 
 impl DecodedFrame {
@@ -124,6 +128,7 @@ impl DecodedFrame {
             pts: None,
             pts_ticks: None,
             visible: None,
+            block_clip: None,
         })
     }
 
@@ -234,6 +239,7 @@ impl DecodedFrame {
         // dimensions validated in `new`, so the view is always Some.
         ReferenceVop::new(&self.luma, self.width, self.height)
             .expect("luma dimensions validated at construction")
+            .with_block_clip(self.block_clip.map(|(w, h)| (w as usize, h as usize)))
     }
 
     /// A [`ReferenceVop`] view over the Cb plane.
@@ -242,6 +248,7 @@ impl DecodedFrame {
     pub fn cb_reference(&self) -> ReferenceVop<'_> {
         ReferenceVop::new(&self.cb, self.width / 2, self.height / 2)
             .expect("chroma dimensions validated at construction")
+            .with_block_clip(self.chroma_block_clip())
     }
 
     /// A [`ReferenceVop`] view over the Cr plane.
@@ -250,6 +257,21 @@ impl DecodedFrame {
     pub fn cr_reference(&self) -> ReferenceVop<'_> {
         ReferenceVop::new(&self.cr, self.width / 2, self.height / 2)
             .expect("chroma dimensions validated at construction")
+            .with_block_clip(self.chroma_block_clip())
+    }
+
+    /// Place 8×8 prediction blocks read from this frame as FFmpeg does,
+    /// within its visible `size` (see
+    /// [`ReferenceVop::block_vector`]).
+    #[inline]
+    #[doc(hidden)] // internal decode plumbing, not the crate's stable public API
+    pub fn set_block_clip(&mut self, size: (u32, u32)) {
+        self.block_clip = Some(size);
+    }
+
+    /// FFmpeg's chrominance clip: half the visible size, rounded down.
+    fn chroma_block_clip(&self) -> Option<(usize, usize)> {
+        self.block_clip.map(|(w, h)| ((w >> 1) as usize, (h >> 1) as usize))
     }
 
     /// Blit one reconstructed macroblock into this frame at macroblock
