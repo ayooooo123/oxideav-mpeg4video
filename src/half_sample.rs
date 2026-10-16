@@ -432,11 +432,78 @@ pub fn interpolate_block_into(
     let (mvx_int, half_x) = split_half_pel(mv_x);
     let (mvy_int, half_y) = split_half_pel(mv_y);
     let rc = vop_rounding_type & 1;
+    if block_w == 0 || block_h == 0 {
+        return;
+    }
+    let x0 = origin_x + mvx_int;
+    let y0 = origin_y + mvy_int;
+    // When every sample the block reads lies inside the plane, the §7.6.4
+    // clamp is the identity and whole rows can be read as slices.
+    let inside = x0 >= 0
+        && y0 >= 0
+        && i64::from(x0) + block_w as i64 + i64::from(half_x) <= i64::from(vop.width)
+        && i64::from(y0) + block_h as i64 + i64::from(half_y) <= i64::from(vop.height);
+    if inside {
+        interpolate_inside(vop, x0 as usize, y0 as usize, block_w, block_h, (half_x, half_y), rc, out);
+        return;
+    }
     for j in 0..block_h {
         for i in 0..block_w {
             let int_x = origin_x + (i as i32) + mvx_int;
             let int_y = origin_y + (j as i32) + mvy_int;
             out[j * block_w + i] = fetch_clamped_sample(vop, int_x, int_y, half_x, half_y, rc);
+        }
+    }
+}
+
+/// [`interpolate_block_into`] for a block whose reads all lie inside the
+/// plane, from the top-left integer sample `(x0, y0)`: the same
+/// §7.6.2.1 sums, a row at a time.
+#[allow(clippy::too_many_arguments)]
+fn interpolate_inside(
+    vop: &ReferenceVop<'_>,
+    x0: usize,
+    y0: usize,
+    block_w: usize,
+    block_h: usize,
+    half: (bool, bool),
+    rc: u8,
+    out: &mut [u8],
+) {
+    let stride = vop.stride as usize;
+    let src = &vop.samples[y0 * stride + x0..];
+    let row = |j: usize| &src[j * stride..j * stride + block_w + 1 - usize::from(!half.0)];
+    let rows = out[..block_w * block_h].chunks_exact_mut(block_w).enumerate();
+    let round = 1 - u16::from(rc);
+    match half {
+        (false, false) => {
+            for (j, dst) in rows {
+                dst.copy_from_slice(row(j));
+            }
+        }
+        (true, false) => {
+            for (j, dst) in rows {
+                let a = row(j);
+                for ((d, &p), &q) in dst.iter_mut().zip(&a[..block_w]).zip(&a[1..]) {
+                    *d = ((u16::from(p) + u16::from(q) + round) >> 1) as u8;
+                }
+            }
+        }
+        (false, true) => {
+            for (j, dst) in rows {
+                for ((d, &p), &q) in dst.iter_mut().zip(row(j)).zip(row(j + 1)) {
+                    *d = ((u16::from(p) + u16::from(q) + round) >> 1) as u8;
+                }
+            }
+        }
+        (true, true) => {
+            for (j, dst) in rows {
+                let (a, c) = (row(j), row(j + 1));
+                let pairs = a[..block_w].iter().zip(&a[1..]).zip(c[..block_w].iter().zip(&c[1..]));
+                for (d, ((&p, &q), (&r, &s))) in dst.iter_mut().zip(pairs) {
+                    *d = ((u16::from(p) + u16::from(q) + u16::from(r) + u16::from(s) + round + 1) >> 2) as u8;
+                }
+            }
         }
     }
 }
