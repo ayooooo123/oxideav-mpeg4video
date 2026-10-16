@@ -70,6 +70,75 @@ impl From<FrameStoreError> for FrameDecodeError {
     }
 }
 
+/// Frames of at least this many macroblocks (CIF) are rebuilt on two
+/// threads; for smaller ones, starting a thread costs more than it saves.
+const PARALLEL_MIN_MACROBLOCKS: usize = 396;
+/// Threads that rebuild a large frame, the calling thread included. On a
+/// Pixel 5a with mimalloc, a second thread made 720p XviD 13% faster and
+/// more threads made it no faster: most of the time goes to reading the
+/// bitstream, which stays on one thread, and each extra thread costs about
+/// 0.5 ms a frame to start. With Android's own allocator a second thread
+/// made decoding slower.
+const MAX_REBUILD_THREADS: usize = 2;
+/// Threads that rebuild a large frame: the CPU's, up to [`MAX_REBUILD_THREADS`].
+static REBUILD_THREADS: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+    std::thread::available_parallelism().map_or(1, |n| n.get()).min(MAX_REBUILD_THREADS)
+});
+
+/// Rebuilds each macroblock of `frame` from `entries` (raster order) with
+/// `rebuild`, and writes it into place. Every macroblock's prediction reads
+/// only reference frames, so rows are independent: they go to up to
+/// [`MAX_REBUILD_THREADS`] threads one row at a time, and a faster core
+/// takes more of them. Fails with the error of the first failing macroblock
+/// in raster order, as a loop on one thread would.
+fn rebuild_rows<E: Sync>(
+    frame: &mut DecodedFrame,
+    mb_width: usize,
+    entries: &[E],
+    rebuild: impl Fn(usize, usize, &E) -> Result<ReconstructedMacroblock, FrameDecodeError> + Sync,
+) -> Result<(), FrameDecodeError> {
+    let mut rows = frame.macroblock_rows_mut().zip(entries.chunks(mb_width)).enumerate();
+    let threads = if entries.len() < PARALLEL_MIN_MACROBLOCKS { 1 } else { *REBUILD_THREADS };
+    if threads <= 1 {
+        return rows.try_for_each(|(mb_row, (mut row, row_entries))| {
+            for (mb_col, entry) in row_entries.iter().enumerate() {
+                row.blit(mb_col, &rebuild(mb_col, mb_row, entry)?);
+            }
+            Ok(())
+        });
+    }
+    let queue = std::sync::Mutex::new(rows);
+    let first_error = std::sync::Mutex::new(None::<(usize, FrameDecodeError)>);
+    let work = || loop {
+        let next = queue.lock().unwrap_or_else(|e| e.into_inner()).next();
+        let Some((mb_row, (mut row, row_entries))) = next else {
+            return;
+        };
+        for (mb_col, entry) in row_entries.iter().enumerate() {
+            match rebuild(mb_col, mb_row, entry) {
+                Ok(mb) => row.blit(mb_col, &mb),
+                Err(error) => {
+                    let mut first = first_error.lock().unwrap_or_else(|e| e.into_inner());
+                    if first.map_or(true, |(at, _)| mb_row < at) {
+                        *first = Some((mb_row, error));
+                    }
+                    break;
+                }
+            }
+        }
+    };
+    std::thread::scope(|scope| {
+        for _ in 1..threads {
+            scope.spawn(&work);
+        }
+        work();
+    });
+    match first_error.into_inner().unwrap_or_else(|e| e.into_inner()) {
+        Some((_, error)) => Err(error),
+        None => Ok(()),
+    }
+}
+
 /// Per-macroblock content for a P-VOP frame assembly.
 ///
 /// Either an inter macroblock (its decoded §7.6 motion + §7.4 residual)
@@ -153,10 +222,8 @@ pub fn assemble_p_vop_frame(
 
     let mut frame = DecodedFrame::new(mb_width * 16, mb_height * 16, VopCodingType::P)?;
 
-    for (idx, entry) in entries.iter().enumerate() {
-        let mb_col = idx % mb_width;
-        let mb_row = idx / mb_width;
-        let reconstructed = match entry {
+    rebuild_rows(&mut frame, mb_width, entries, |mb_col, mb_row, entry| {
+        Ok(match entry {
             PVopMbContent::Inter { motion, residual } => reconstruct_pvop_macroblock(
                 *motion,
                 &luma_ref,
@@ -211,9 +278,8 @@ pub fn assemble_p_vop_frame(
                 reconstruct_inter_macroblock(&prediction, residual, bits_per_pixel)
             }
             PVopMbContent::Intra(mb) => mb.clone(),
-        };
-        frame.blit_macroblock(mb_col, mb_row, &reconstructed)?;
-    }
+        })
+    })?;
 
     Ok(frame)
 }
@@ -563,12 +629,10 @@ pub fn assemble_b_vop_frame(
     };
 
     let mut frame = DecodedFrame::new(mb_width * 16, mb_height * 16, VopCodingType::B)?;
-    for (idx, entry) in entries.iter().enumerate() {
-        let mb_col = idx % mb_width;
-        let mb_row = idx / mb_width;
+    rebuild_rows(&mut frame, mb_width, entries, |mb_col, mb_row, entry| {
         // §7.6.9.5.2: direct-mode vectors are half-pel even in a
         // quarter-sample VOL; every other mode follows the VOL grid.
-        let reconstructed = entry.motion.reconstruct(
+        Ok(entry.motion.reconstruct(
             &anchors,
             &entry.residual,
             (mb_col * 16) as i32,
@@ -576,9 +640,8 @@ pub fn assemble_b_vop_frame(
             vop_rounding_type,
             entry.motion.luma_sample_mode(sample_mode),
             bits_per_pixel,
-        );
-        frame.blit_macroblock(mb_col, mb_row, &reconstructed)?;
-    }
+        ))
+    })?;
     Ok(frame)
 }
 

@@ -300,29 +300,30 @@ impl DecodedFrame {
                 mb_height: mb_h,
             });
         }
-
-        // Luma: 16×16 at (16*col, 16*row), stride == width.
-        let luma_x0 = mb_col * MACROBLOCK_LUMA_SIDE;
-        let luma_y0 = mb_row * MACROBLOCK_LUMA_SIDE;
-        for (dy, row) in mb.luma.iter().enumerate() {
-            let base = (luma_y0 + dy) * self.width + luma_x0;
-            for (dx, &sample) in row.iter().enumerate() {
-                self.luma[base + dx] = sample.clamp(0, 255) as u8;
-            }
+        let width = self.width;
+        let luma_len = width * MACROBLOCK_LUMA_SIDE;
+        let chroma_len = width / 2 * MACROBLOCK_CHROMA_SIDE;
+        MacroblockRowMut {
+            luma: &mut self.luma[mb_row * luma_len..][..luma_len],
+            cb: &mut self.cb[mb_row * chroma_len..][..chroma_len],
+            cr: &mut self.cr[mb_row * chroma_len..][..chroma_len],
+            width,
         }
-
-        // Chroma: 8×8 at (8*col, 8*row), stride == width/2.
-        let chroma_w = self.width / 2;
-        let chroma_x0 = mb_col * MACROBLOCK_CHROMA_SIDE;
-        let chroma_y0 = mb_row * MACROBLOCK_CHROMA_SIDE;
-        for (dy, (cb_row, cr_row)) in mb.cb.iter().zip(mb.cr.iter()).enumerate() {
-            let base = (chroma_y0 + dy) * chroma_w + chroma_x0;
-            for (dx, (&cb_s, &cr_s)) in cb_row.iter().zip(cr_row.iter()).enumerate() {
-                self.cb[base + dx] = cb_s.clamp(0, 255) as u8;
-                self.cr[base + dx] = cr_s.clamp(0, 255) as u8;
-            }
-        }
+        .blit(mb_col, mb);
         Ok(())
+    }
+
+    /// The frame's macroblock rows, top to bottom, each writable on its
+    /// own, so a row's macroblocks can be rebuilt on another thread.
+    #[doc(hidden)] // internal decode plumbing, not the crate's stable public API
+    pub fn macroblock_rows_mut(&mut self) -> impl Iterator<Item = MacroblockRowMut<'_>> {
+        let width = self.width;
+        let chroma_len = width / 2 * MACROBLOCK_CHROMA_SIDE;
+        self.luma
+            .chunks_mut(width * MACROBLOCK_LUMA_SIDE)
+            .zip(self.cb.chunks_mut(chroma_len))
+            .zip(self.cr.chunks_mut(chroma_len))
+            .map(move |((luma, cb), cr)| MacroblockRowMut { luma, cb, cr, width })
     }
 
     /// Read back a single luma sample (debug / test helper). Returns
@@ -333,6 +334,42 @@ impl DecodedFrame {
             return None;
         }
         Some(self.luma[y * self.width + x])
+    }
+}
+
+/// One macroblock row of a [`DecodedFrame`]: its 16 luma rows and 8 rows
+/// of each chroma plane (see [`DecodedFrame::macroblock_rows_mut`]).
+#[doc(hidden)] // internal decode plumbing, not the crate's stable public API
+#[derive(Debug)]
+pub struct MacroblockRowMut<'a> {
+    luma: &'a mut [u8],
+    cb: &'a mut [u8],
+    cr: &'a mut [u8],
+    width: usize,
+}
+
+impl MacroblockRowMut<'_> {
+    /// Writes the macroblock at column `mb_col` of this row, each sample
+    /// clamped into `[0, 255]` as [`DecodedFrame::blit_macroblock`] does.
+    pub fn blit(&mut self, mb_col: usize, mb: &ReconstructedMacroblock) {
+        let x0 = mb_col * MACROBLOCK_LUMA_SIDE;
+        for (dy, row) in mb.luma.iter().enumerate() {
+            let base = dy * self.width + x0;
+            for (out, &sample) in self.luma[base..base + MACROBLOCK_LUMA_SIDE].iter_mut().zip(row) {
+                *out = sample.clamp(0, 255) as u8;
+            }
+        }
+        let chroma_w = self.width / 2;
+        let cx0 = mb_col * MACROBLOCK_CHROMA_SIDE;
+        for (dy, (cb_row, cr_row)) in mb.cb.iter().zip(&mb.cr).enumerate() {
+            let base = dy * chroma_w + cx0;
+            for (out, &sample) in self.cb[base..base + MACROBLOCK_CHROMA_SIDE].iter_mut().zip(cb_row) {
+                *out = sample.clamp(0, 255) as u8;
+            }
+            for (out, &sample) in self.cr[base..base + MACROBLOCK_CHROMA_SIDE].iter_mut().zip(cr_row) {
+                *out = sample.clamp(0, 255) as u8;
+            }
+        }
     }
 }
 
