@@ -472,6 +472,12 @@ fn interpolate_inside(
 ) {
     let stride = vop.stride as usize;
     let src = &vop.samples[y0 * stride + x0..];
+    #[cfg(any(target_arch = "aarch64", all(target_arch = "wasm32", target_feature = "simd128")))]
+    if block_w == 8 || block_w == 16 {
+        let phase = u8::from(half.0) | (u8::from(half.1) << 1);
+        crate::simd::pixels(out, block_w, src, stride, block_w, block_h, phase, 1 - u16::from(rc), false);
+        return;
+    }
     let row = |j: usize| &src[j * stride..j * stride + block_w + 1 - usize::from(!half.0)];
     let rows = out[..block_w * block_h].chunks_exact_mut(block_w).enumerate();
     let round = 1 - u16::from(rc);

@@ -355,6 +355,8 @@ pub mod half_sample;
 #[doc(hidden)]
 pub mod idct;
 pub mod ffmpeg_idct;
+#[cfg(any(target_arch = "aarch64", all(target_arch = "wasm32", target_feature = "simd128")))]
+mod simd;
 #[doc(hidden)]
 pub mod interlaced_information;
 #[doc(hidden)]

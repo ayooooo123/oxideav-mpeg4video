@@ -688,7 +688,8 @@ fn compute_l<S: QpelSource>(vop: &S, int_x: i32, int_y: i32, rc: u8, bpp: u32) -
 /// `E[size-1+k] = R[size-k]` for `k = 1..=3`.
 struct MirroredRefBlock {
     /// Row-major `(M+1)×(N+1)` interior samples.
-    data: Vec<u8>,
+    data: [u8; 17 * 17],
+    large: Vec<u8>,
     /// Interior width `M + 1`.
     w: i32,
     /// Interior height `N + 1`.
@@ -699,17 +700,56 @@ impl MirroredRefBlock {
     /// Read the `(w)×(h)` interior block whose top-left integer-pel
     /// sits at source coordinate `(x0, y0)`.
     fn read<S: QpelSource>(src: &S, x0: i32, y0: i32, w: usize, h: usize) -> Self {
-        let mut data = vec![0u8; w * h];
+        let mut block = Self { data: [0; 17 * 17], large: Vec::new(), w: w as i32, h: h as i32 };
+        let len = w * h;
+        let data = if len <= block.data.len() { &mut block.data[..len] } else {
+            block.large.resize(len, 0);
+            &mut block.large
+        };
         for (j, row) in data.chunks_exact_mut(w).enumerate() {
             for (i, px) in row.iter_mut().enumerate() {
                 *px = src.fetch(x0 + i as i32, y0 + j as i32);
             }
         }
-        Self {
-            data,
-            w: w as i32,
-            h: h as i32,
+        block
+    }
+
+    #[cfg(any(target_arch = "aarch64", all(target_arch = "wasm32", target_feature = "simd128")))]
+    fn interpolate(&self, qx: u8, qy: u8, rc: u8, bpp: u32, out: &mut [u8]) -> bool {
+        let w = (self.w - 1) as usize;
+        let h = (self.h - 1) as usize;
+        if !matches!(w, 8 | 16) || h > 16 || bpp != 8 { return false; }
+        let mut horizontal = [[0u8; 16]; 17];
+        for (y, row) in horizontal[..=h].iter_mut().enumerate() {
+            if qx == 0 {
+                row[..w].copy_from_slice(&self.data[y * (w + 1)..y * (w + 1) + w]);
+            } else {
+                let mut extended = [0u8; 24];
+                for (x, p) in extended[..w + 7].iter_mut().enumerate() {
+                    *p = self.fetch(x as i32 - 3, y as i32);
+                }
+                let taps = core::array::from_fn(|k| &extended[k..k + w]);
+                crate::simd::fir(&mut row[..w], taps, rc);
+                if qx != 2 {
+                    for (x, p) in row[..w].iter_mut().enumerate() {
+                        *p = bilinear(*p, self.fetch(x as i32 + i32::from(qx == 3), y as i32), rc, 8);
+                    }
+                }
+            }
         }
+        for y in 0..h {
+            let dst = &mut out[y * w..(y + 1) * w];
+            if qy == 0 { dst.copy_from_slice(&horizontal[y][..w]); } else {
+                let taps = core::array::from_fn(|k| &horizontal[mirror_index(y as i32 + k as i32 - 3, self.h) as usize][..w]);
+                crate::simd::fir(dst, taps, rc);
+                if qy != 2 {
+                    for (x, p) in dst.iter_mut().enumerate() {
+                        *p = bilinear(*p, horizontal[y + usize::from(qy == 3)][x], rc, 8);
+                    }
+                }
+            }
+        }
+        true
     }
 }
 
@@ -732,7 +772,8 @@ impl QpelSource for MirroredRefBlock {
     fn fetch(&self, x: i32, y: i32) -> u8 {
         let mx = mirror_index(x, self.w);
         let my = mirror_index(y, self.h);
-        self.data[(my * self.w + mx) as usize]
+        let at = (my * self.w + mx) as usize;
+        if self.large.is_empty() { self.data[at] } else { self.large[at] }
     }
 }
 
@@ -830,6 +871,8 @@ pub fn interpolate_block_qpel_into(
         block_w + 1,
         block_h + 1,
     );
+    #[cfg(any(target_arch = "aarch64", all(target_arch = "wasm32", target_feature = "simd128")))]
+    if block.interpolate(qfx, qfy, rc, bits_per_pixel, out) { return; }
     for j in 0..block_h {
         for i in 0..block_w {
             out[j * block_w + i] = interpolate_quarter_pixel_src(
@@ -918,6 +961,8 @@ pub fn interpolate_block_qpel_field_into(
         block_w + 1,
         block_h + 1,
     );
+    #[cfg(any(target_arch = "aarch64", all(target_arch = "wasm32", target_feature = "simd128")))]
+    if block.interpolate(qfx, qfy, rc, bits_per_pixel, out) { return; }
     for j in 0..block_h {
         for i in 0..block_w {
             out[j * block_w + i] = interpolate_quarter_pixel_src(
@@ -969,6 +1014,33 @@ pub fn interpolate_block_qpel_field(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(any(target_arch = "aarch64", all(target_arch = "wasm32", target_feature = "simd128")))]
+    fn separable_simd_matches_pixel_cascade() {
+        let samples: Vec<u8> = (0..32 * 32).map(|i| ((i * 73 + i / 7) & 255) as u8).collect();
+        let vop = ReferenceVop::new(&samples, 32, 32).unwrap();
+        for w in [8, 16] {
+            for h in [8, 16] {
+                for rc in [0, 1] {
+                    for x in [-3, 5, 25] {
+                        let block = MirroredRefBlock::read(&vop, x, x, w + 1, h + 1);
+                        for qx in 0..4 {
+                            for qy in 0..4 {
+                                let mut actual = [0u8; 256];
+                                assert!(block.interpolate(qx, qy, rc, 8, &mut actual));
+                                for y in 0..h {
+                                    for x in 0..w {
+                                        assert_eq!(actual[y * w + x], interpolate_quarter_pixel_src(&block, x as i32, y as i32, qx, qy, rc, 8));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     // ─────────────────────── split_quarter_pel ───────────────────────
 

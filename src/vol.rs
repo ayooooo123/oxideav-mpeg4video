@@ -713,6 +713,7 @@ fn parse_vol_control(br: &mut BitReader<'_>) -> Result<VolControlParameters, Vol
 /// `VisualObjectSequence`, so a standalone VOL slice will not know it
 /// and must pass in `0`.
 #[doc(hidden)] // internal decode plumbing, not the crate's stable public API
+#[cold]
 pub fn parse_video_object_layer(
     data: &[u8],
     profile_level: u8,
@@ -728,6 +729,7 @@ pub fn parse_video_object_layer(
     parse_video_object_layer_body(&mut br, profile_level)
 }
 
+#[cold]
 fn parse_video_object_layer_body(
     br: &mut BitReader<'_>,
     profile_level: u8,
@@ -1003,6 +1005,7 @@ fn parse_video_object_layer_body(
 /// `0x000001B0`. Studio profiles (`0xE1`..=`0xE8` per §6.2.2) return
 /// [`VolParseError::UnsupportedProfile`].
 #[doc(hidden)] // internal decode plumbing, not the crate's stable public API
+#[cold]
 pub fn parse_visual_object_sequence_header(data: &[u8]) -> Result<u8, VolParseError> {
     let mut br = BitReader::new(data);
     let sc = br.read_bits(32)?;
@@ -1076,6 +1079,7 @@ fn parse_video_signal_type(
 /// flag is clear, [`VisualObjectHeader::video_signal_type`] is `None`
 /// and the §6.3.2.4 defaults (BT.709 colour, studio swing) apply.
 #[doc(hidden)] // internal decode plumbing, not the crate's stable public API
+#[cold]
 pub fn parse_visual_object_header(data: &[u8]) -> Result<VisualObjectHeader, VolParseError> {
     let mut br = BitReader::new(data);
     let sc = br.read_bits(32)?;

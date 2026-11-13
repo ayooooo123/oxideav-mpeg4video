@@ -380,6 +380,7 @@ pub fn vop_time_increment_bits(resolution: u16) -> u8 {
 /// Parse a §6.2.4 `Group_of_VideoObjectPlane` header starting at the
 /// `group_of_vop_start_code` (`0x000001B3`).
 #[doc(hidden)] // internal decode plumbing, not the crate's stable public API
+#[cold]
 pub fn parse_group_of_vop_header(data: &[u8]) -> Result<GovHeader, VopParseError> {
     let mut br = BitReader::new(data);
     let sc = br.read_bits(32)?;
@@ -392,6 +393,7 @@ pub fn parse_group_of_vop_header(data: &[u8]) -> Result<GovHeader, VopParseError
     parse_group_of_vop_body(&mut br)
 }
 
+#[cold]
 fn parse_group_of_vop_body(br: &mut BitReader<'_>) -> Result<GovHeader, VopParseError> {
     // Table 6-23: 5 hours + 6 minutes + 1 marker + 6 seconds = 18 bits.
     let hours = br.read_bits(5)? as u8;
