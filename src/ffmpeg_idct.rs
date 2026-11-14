@@ -96,7 +96,10 @@ pub fn idct_row_cond_dc(row: &mut [i16; 8]) {
 }
 
 /// `IDCT_COLS` — the sparse column pass, reading `col[8*n]`.
-#[cfg(not(any(target_arch = "aarch64", all(target_arch = "wasm32", target_feature = "simd128"))))]
+#[cfg(not(any(
+    target_arch = "aarch64",
+    all(target_arch = "wasm32", target_feature = "simd128")
+)))]
 fn idct_cols(col: &[i16; 64], c: usize) -> (u32, u32, u32, u32, u32, u32, u32, u32) {
     // `col[r * 8]` holds the column's coefficient for row `r` (the
     // caller assembles it in the same strided layout the C's `block +
@@ -104,8 +107,8 @@ fn idct_cols(col: &[i16; 64], c: usize) -> (u32, u32, u32, u32, u32, u32, u32, u
     // the C's `col[8 * n]` reads exactly.
     let rd = |n: usize| -> u32 { col[8 * n + c] as i32 as u32 };
 
-    let mut a0: u32 = (W4 as u32)
-        .wrapping_mul(rd(0).wrapping_add(((1 << (COL_SHIFT - 1)) / W4 as u32) as u32));
+    let mut a0: u32 =
+        (W4 as u32).wrapping_mul(rd(0).wrapping_add(((1 << (COL_SHIFT - 1)) / W4 as u32) as u32));
     let mut a1 = a0;
     let mut a2 = a0;
     let mut a3 = a0;
@@ -166,16 +169,34 @@ fn transform(block: &mut [i16; 64]) -> [[i32; 8]; 8] {
     for row in block.chunks_exact_mut(8) {
         idct_row_cond_dc(row.try_into().unwrap());
     }
-    #[cfg(any(target_arch = "aarch64", all(target_arch = "wasm32", target_feature = "simd128")))]
-    { crate::simd::columns(block) }
-    #[cfg(not(any(target_arch = "aarch64", all(target_arch = "wasm32", target_feature = "simd128"))))]
+    #[cfg(any(
+        target_arch = "aarch64",
+        all(target_arch = "wasm32", target_feature = "simd128")
+    ))]
+    {
+        crate::simd::columns(block)
+    }
+    #[cfg(not(any(
+        target_arch = "aarch64",
+        all(target_arch = "wasm32", target_feature = "simd128")
+    )))]
     {
         let mut out = [[0i32; 8]; 8];
         for c in 0..8 {
-            let (a0,a1,a2,a3,b0,b1,b2,b3) = idct_cols(block, c);
-            let v = [a0.wrapping_add(b0), a1.wrapping_add(b1), a2.wrapping_add(b2), a3.wrapping_add(b3),
-                a3.wrapping_sub(b3), a2.wrapping_sub(b2), a1.wrapping_sub(b1), a0.wrapping_sub(b0)];
-            for r in 0..8 { out[r][c] = (v[r] as i32) >> COL_SHIFT; }
+            let (a0, a1, a2, a3, b0, b1, b2, b3) = idct_cols(block, c);
+            let v = [
+                a0.wrapping_add(b0),
+                a1.wrapping_add(b1),
+                a2.wrapping_add(b2),
+                a3.wrapping_add(b3),
+                a3.wrapping_sub(b3),
+                a2.wrapping_sub(b2),
+                a1.wrapping_sub(b1),
+                a0.wrapping_sub(b0),
+            ];
+            for r in 0..8 {
+                out[r][c] = (v[r] as i32) >> COL_SHIFT;
+            }
         }
         out
     }
@@ -191,7 +212,9 @@ pub fn simple_idct_add_8bit(block: &mut [i16; 64]) -> [[i16; 8]; 8] {
     let rows = transform(block);
     let mut out = [[0i16; 8]; 8];
     for c in 0..8 {
-        for r in 0..8 { out[c][r] = rows[r][c] as i16; }
+        for r in 0..8 {
+            out[c][r] = rows[r][c] as i16;
+        }
     }
     out
 }
@@ -204,11 +227,21 @@ pub fn simple_idct_put_8bit(block: &mut [i16; 64]) -> [[u8; 8]; 8] {
     for r in 0..8 {
         let values = rows[r].map(|v| v as i16);
         let mut pixels = [0u8; 8];
-        #[cfg(any(target_arch = "aarch64", all(target_arch = "wasm32", target_feature = "simd128")))]
+        #[cfg(any(
+            target_arch = "aarch64",
+            all(target_arch = "wasm32", target_feature = "simd128")
+        ))]
         crate::simd::residual(&mut pixels, &values, false);
-        #[cfg(not(any(target_arch = "aarch64", all(target_arch = "wasm32", target_feature = "simd128"))))]
-        for c in 0..8 { pixels[c] = values[c].clamp(0, 255) as u8; }
-        for c in 0..8 { out[c][r] = pixels[c]; }
+        #[cfg(not(any(
+            target_arch = "aarch64",
+            all(target_arch = "wasm32", target_feature = "simd128")
+        )))]
+        for c in 0..8 {
+            pixels[c] = values[c].clamp(0, 255) as u8;
+        }
+        for c in 0..8 {
+            out[c][r] = pixels[c];
+        }
     }
     out
 }

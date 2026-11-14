@@ -140,8 +140,7 @@
 //!   when no matrix was loaded (`quant_type == 1`).
 
 use crate::bitreader::BitReader;
-use crate::idct::idct_8x8;
-use crate::inverse_quant::{inverse_quant_method1, inverse_quant_method2, InverseQuantContext};
+use crate::inverse_quant::{InverseQuantContext, inverse_quant_method1, inverse_quant_method2};
 use crate::macroblock::{DerivedMbType, MacroblockHeader};
 use crate::predictor::{
     dc_scaler, default_neighbour_dc, predict_intra_ac_column, predict_intra_ac_row,
@@ -149,7 +148,7 @@ use crate::predictor::{
 };
 use crate::scan::{events_to_qfs, inverse_scan, select_scan_type};
 use crate::texture::{
-    decode_ac_events, decode_intra_dc, DcComponent, TcoefTable, TextureParseError,
+    DcComponent, TcoefTable, TextureParseError, decode_ac_events, decode_intra_dc,
 };
 use crate::vol::VolHeader;
 
@@ -188,6 +187,7 @@ pub const DEFAULT_NONINTRA_QUANT_MATRIX: [[u8; 8]; 8] = [
 
 /// Errors produced while assembling a `block(i)` / macroblock.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum BlockAssemblyError {
     /// The supplied macroblock header is not an intra macroblock; this
     /// driver only handles the intra `block(i)` assembly so far.
@@ -323,6 +323,12 @@ pub struct MacroblockTextureContext {
     /// on the non-intra decode paths or under method 2
     /// (`quant_type == false`).
     pub intra_mismatch_exempt: bool,
+    /// Which §7.4.5 inverse transform reconstructs the block
+    /// ([`crate::idct::BlockTransform`]): the exact Annex A transform
+    /// with its half-integer rule (ecosystem-compat selects `ToEven`,
+    /// the default `AwayFromZero`) or the integer row–column variant.
+    /// Applies to intra and inter blocks alike.
+    pub transform: crate::idct::BlockTransform,
 }
 
 /// A reconstructed intra 4:2:0 macroblock: a 16×16 luminance plane plus
@@ -671,7 +677,7 @@ fn decode_intra_block_tail(
 
     // §7.4.5 + Annex A — inverse DCT (output saturated to
     // [-2^bpp, 2^bpp - 1]).
-    let spatial = idct_8x8(&f, ctx.bits_per_pixel);
+    let spatial = ctx.transform.apply(&f, ctx.bits_per_pixel);
 
     // §6.3.2 / §7.6 — for an intra block there is no prediction to add,
     // so the reconstructed sample is the IDCT output clipped to the
@@ -832,7 +838,7 @@ pub fn decode_intra_macroblock(
 /// matrix when `ctx.quant_type == true`, else method 2 with the
 /// `(2*|QF| + 1) * qs` formula and the §7.4.4.2 sign-incorporation).
 /// The §7.4.5 + Annex A IDCT produces the residual `f[y][x]`, already
-/// saturated to `[-2^bpp, 2^bpp - 1]` by [`idct_8x8`].
+/// saturated to `[-2^bpp, 2^bpp - 1]` by [`crate::idct::idct_8x8`].
 ///
 /// Per §7.3 step-2 the caller adds `p[y][x]` from motion compensation
 /// and clips the resulting `d[y][x]` to `[0, 2^bpp - 1]` (the §7.3
@@ -949,9 +955,10 @@ pub fn inter_block_from_events(
     };
 
     // §7.4.5 + Annex A — inverse DCT. The inter residual is signed:
-    // FFmpeg's inter path uses add-semantics (no 0..255 clip; the clip
-    // happens after the §7.3 prediction add) — see `idct_8x8_inter_residual`.
-    Ok(crate::idct::idct_8x8_inter_residual(&f, ctx.bits_per_pixel))
+    // FFmpeg's inter path uses add-semantics at 8 bpp (no 0..255 clip;
+    // the clip happens after the §7.3 prediction add) — see
+    // `BlockTransform::apply_inter`.
+    Ok(ctx.transform.apply_inter(&f, ctx.bits_per_pixel))
 }
 
 /// Decode and reconstruct one inter 4:2:0 macroblock's signed-residual
@@ -1149,6 +1156,7 @@ mod tests {
             ac_pred_flag: false,
             alternate_vertical_scan: false,
             intra_mismatch_exempt: false,
+            transform: crate::idct::BlockTransform::SPEC,
         };
         let predictors = BlockPredictors::outside(8, 8);
 
@@ -1233,6 +1241,7 @@ mod tests {
             ac_pred_flag: false,
             alternate_vertical_scan: false,
             intra_mismatch_exempt: false,
+            transform: crate::idct::BlockTransform::SPEC,
         };
         let predictors = BlockPredictors::outside(8, 8);
 
@@ -1255,10 +1264,10 @@ mod tests {
         // QF[0][0] = PQFX[0][0] + chosen/dc_scaler = 0 + 1024 / dc_scaler.
         let scaler = dc_scaler(DcComponent::Luminance, 8) as i32; // qs=8 → 16
         let qf00 = 1024 / scaler; // = 64
-                                  // method-2 intra DC: F''[0][0] = dc_scaler * QF[0][0].
+        // method-2 intra DC: F''[0][0] = dc_scaler * QF[0][0].
         let f00 = scaler * qf00; // = 16 * 64 = 1024
-                                 // Flat block: every spatial sample = F''[0][0] / 8 (the DC term
-                                 // of the orthonormal IDCT). 1024 / 8 = 128.
+        // Flat block: every spatial sample = F''[0][0] / 8 (the DC term
+        // of the orthonormal IDCT). 1024 / 8 = 128.
         let expected = (f00 / 8).clamp(0, 255);
         for row in block.iter() {
             for &px in row.iter() {
@@ -1280,6 +1289,7 @@ mod tests {
             ac_pred_flag: false,
             alternate_vertical_scan: false,
             intra_mismatch_exempt: false,
+            transform: crate::idct::BlockTransform::SPEC,
         };
         let predictors = BlockPredictors::outside(8, 8);
 
@@ -1300,7 +1310,7 @@ mod tests {
         .unwrap();
 
         let scaler = dc_scaler(DcComponent::Luminance, 8) as i32; // 16
-                                                                  // QF[0][0] = +1 (differential) + 1024/16 = 1 + 64 = 65.
+        // QF[0][0] = +1 (differential) + 1024/16 = 1 + 64 = 65.
         let qf00 = 1 + 1024 / scaler;
         let f00 = scaler * qf00; // 16 * 65 = 1040
         let expected = (f00 / 8).clamp(0, 255); // 130
@@ -1324,6 +1334,7 @@ mod tests {
             ac_pred_flag: false,
             alternate_vertical_scan: false,
             intra_mismatch_exempt: false,
+            transform: crate::idct::BlockTransform::SPEC,
         };
         let predictors = BlockPredictors::outside(8, 8);
         let data = [0xAAu8; 4]; // arbitrary — must remain unread
@@ -1366,6 +1377,7 @@ mod tests {
             ac_pred_flag: false,
             alternate_vertical_scan: false,
             intra_mismatch_exempt: false,
+            transform: crate::idct::BlockTransform::SPEC,
         };
         let predictors = BlockPredictors::outside(8, 8);
         let mut w = BitWriter::default();
@@ -1404,6 +1416,7 @@ mod tests {
             ac_pred_flag: false,
             alternate_vertical_scan: false,
             intra_mismatch_exempt: false,
+            transform: crate::idct::BlockTransform::SPEC,
         };
         let predictors = BlockPredictors::outside(8, 8);
         let mut w = BitWriter::default();
@@ -1456,6 +1469,7 @@ mod tests {
             ac_pred_flag: false,
             alternate_vertical_scan: false,
             intra_mismatch_exempt: false,
+            transform: crate::idct::BlockTransform::SPEC,
         };
         let predictors = BlockPredictors::outside(8, 8);
 
@@ -1485,13 +1499,15 @@ mod tests {
                 assert_eq!(px, 128);
             }
         }
-        // Chroma: dc_scaler(Chrominance, qs=8) = (8+13)/2 = 10; the DC
-        // wire level 1024 dequantises to 1024/cscaler = 102, and the
-                                // Flat IDCT sample: the FFmpeg integer simple IDCT (the reference
-                                // of record since `ffmpeg_idct`) computes the column pass with
-                                // truncating shifts, so cscaler*cqf = 1020 → 127, not the f64
-                                // path's rounded 128.
-        let cexp = 127i32.clamp(0, 255); // 127
+        // Chroma: dc_scaler(Chrominance, qs=8) = (8+13)/2 = 10.
+        let cscaler = dc_scaler(DcComponent::Chrominance, 8) as i32; // 10
+        let cqf = 1024 / cscaler; // 102
+        let cf = cscaler * cqf; // 1020
+        // Flat IDCT sample = round(F''[0][0] / 8); 1020 / 8 = 127.5 →
+        // 128 under the §4.1 round-to-nearest (away from zero) of §7.4.5
+        // (the context's `BlockTransform::SPEC`; the integer simple IDCT
+        // gives 127).
+        let cexp = (((cf as f64) / 8.0).round() as i32).clamp(0, 255); // 128
         for row in mb.cb.iter() {
             for &px in row.iter() {
                 assert_eq!(px, cexp);
@@ -1517,6 +1533,7 @@ mod tests {
             ac_pred_flag: false,
             alternate_vertical_scan: false,
             intra_mismatch_exempt: false,
+            transform: crate::idct::BlockTransform::SPEC,
         };
         let predictors = BlockPredictors::outside(8, 8);
 
@@ -1568,6 +1585,7 @@ mod tests {
             ac_pred_flag: false,
             alternate_vertical_scan: false,
             intra_mismatch_exempt: false,
+            transform: crate::idct::BlockTransform::SPEC,
         };
         let data = [0u8; 4];
         let mut br = BitReader::new(&data);
@@ -1601,6 +1619,7 @@ mod tests {
             ac_pred_flag: false,
             alternate_vertical_scan: false,
             intra_mismatch_exempt: false,
+            transform: crate::idct::BlockTransform::SPEC,
         };
         let data = [0u8; 4];
         let mut br = BitReader::new(&data);
@@ -1627,6 +1646,7 @@ mod tests {
             ac_pred_flag: false,
             alternate_vertical_scan: false,
             intra_mismatch_exempt: false,
+            transform: crate::idct::BlockTransform::SPEC,
         };
         // Two bytes of garbage — none of it should be consumed because
         // `coded == false` short-circuits before the bit reader is touched.
@@ -1660,6 +1680,7 @@ mod tests {
             ac_pred_flag: false,
             alternate_vertical_scan: false,
             intra_mismatch_exempt: false,
+            transform: crate::idct::BlockTransform::SPEC,
         };
 
         let mut w = BitWriter::default();
@@ -1698,6 +1719,7 @@ mod tests {
             ac_pred_flag: false,
             alternate_vertical_scan: false,
             intra_mismatch_exempt: false,
+            transform: crate::idct::BlockTransform::SPEC,
         };
 
         let mut w = BitWriter::default();
@@ -1744,6 +1766,7 @@ mod tests {
             ac_pred_flag: false,
             alternate_vertical_scan: false,
             intra_mismatch_exempt: false,
+            transform: crate::idct::BlockTransform::SPEC,
         };
         let data = [0u8; 4];
         let mut br = BitReader::new(&data);
@@ -1789,6 +1812,7 @@ mod tests {
             ac_pred_flag: false,
             alternate_vertical_scan: false,
             intra_mismatch_exempt: false,
+            transform: crate::idct::BlockTransform::SPEC,
         };
 
         let mut w = BitWriter::default();
@@ -1855,6 +1879,7 @@ mod tests {
             ac_pred_flag: false,
             alternate_vertical_scan: false,
             intra_mismatch_exempt: false,
+            transform: crate::idct::BlockTransform::SPEC,
         };
         let data = [0u8; 4];
         let mut br = BitReader::new(&data);
@@ -1893,6 +1918,7 @@ mod tests {
             ac_pred_flag: false,
             alternate_vertical_scan: false,
             intra_mismatch_exempt: false,
+            transform: crate::idct::BlockTransform::SPEC,
         };
         let data = [0u8; 4];
         let mut br = BitReader::new(&data);
@@ -1925,6 +1951,7 @@ mod tests {
             ac_pred_flag: false,
             alternate_vertical_scan: false,
             intra_mismatch_exempt: false,
+            transform: crate::idct::BlockTransform::SPEC,
         };
         let mut w = BitWriter::default();
         // Block 0 — one positive (LAST=1, RUN=0, LEVEL=1) inter EVENT.
@@ -1986,6 +2013,7 @@ mod tests {
             ac_pred_flag: false,
             alternate_vertical_scan: false,
             intra_mismatch_exempt: false,
+            transform: crate::idct::BlockTransform::SPEC,
         };
         let data = [0u8; 4];
         let mut br = BitReader::new(&data);
@@ -2024,6 +2052,7 @@ mod tests {
             ac_pred_flag: false,
             alternate_vertical_scan: false,
             intra_mismatch_exempt: false,
+            transform: crate::idct::BlockTransform::SPEC,
         };
 
         let mut w = BitWriter::default();
@@ -2064,6 +2093,7 @@ mod tests {
             ac_pred_flag: false,
             alternate_vertical_scan: false,
             intra_mismatch_exempt: false,
+            transform: crate::idct::BlockTransform::SPEC,
         };
         let predictors = BlockPredictors::outside(8, 8);
 
@@ -2113,6 +2143,7 @@ mod tests {
             ac_pred_flag: false,
             alternate_vertical_scan: false,
             intra_mismatch_exempt: true,
+            transform: crate::idct::BlockTransform::SPEC,
         };
         let predictors = BlockPredictors::outside(8, 8);
         let mut w = BitWriter::default();

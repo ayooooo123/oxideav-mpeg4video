@@ -49,6 +49,7 @@ pub const MAX_STATIC_WARPING_POINTS: usize = 4;
 
 /// Errors raised while decoding a `sprite_trajectory()`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SpriteTrajectoryError {
     /// The bitstream ran out mid-codeword.
     Truncated,
@@ -130,11 +131,7 @@ pub fn decode_warping_mv_code(br: &mut BitReader<'_>) -> Result<i32, SpriteTraje
                     return Err(SpriteTrajectoryError::LengthOverflow);
                 }
             }
-            if extra == 0 {
-                5
-            } else {
-                5 + extra
-            }
+            if extra == 0 { 5 } else { 5 + extra }
         }
     };
 

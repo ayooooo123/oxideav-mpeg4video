@@ -4,11 +4,11 @@
 //! reorder timing, and determinism.
 
 use oxideav_core::Encoder as _;
-use oxideav_mpeg4video::bvop_encode::{encode_b_vop, BVopEncodeStats};
+use oxideav_mpeg4video::bvop_encode::{BVopEncodeStats, encode_b_vop};
 use oxideav_mpeg4video::decoder::Mpeg4VideoDecoder;
 use oxideav_mpeg4video::framestore::{DecodedFrame, FrameStore};
 use oxideav_mpeg4video::ivop_encode::{
-    encode_i_vop, write_configuration_headers, EncoderConfig, FrameView,
+    EncoderConfig, FrameView, encode_i_vop, write_configuration_headers,
 };
 use oxideav_mpeg4video::pvop_encode::{encode_p_vop, reconstruct_own_p_vop_with_motion};
 use oxideav_mpeg4video::vol::parse_video_object_layer;
@@ -105,12 +105,10 @@ fn build_ibp(cfg: &EncoderConfig, qp: u32) -> (Vec<u8>, Vec<DecodedFrame>, BVopE
 
 #[test]
 fn ibp_stream_self_decodes_sample_exact() {
-    let cfg = EncoderConfig {
-        width: 64,
-        height: 64,
-        b_vops: true,
-        ..EncoderConfig::default()
-    };
+    let cfg = EncoderConfig::default()
+        .with_width(64)
+        .with_height(64)
+        .with_b_vops(true);
     assert_eq!(cfg.profile_and_level(), 0xF3, "B-VOPs select ASP");
     let (stream, recons, stats) = build_ibp(&cfg, 4);
     let decoded = decode_full(&stream);
@@ -125,14 +123,12 @@ fn ibp_stream_self_decodes_sample_exact() {
 #[test]
 fn ibp_stream_qpel_and_method1_self_decode() {
     for (quant_type, quarter_sample) in [(true, false), (false, true), (true, true)] {
-        let cfg = EncoderConfig {
-            width: 64,
-            height: 48,
-            quant_type,
-            quarter_sample,
-            b_vops: true,
-            ..EncoderConfig::default()
-        };
+        let cfg = EncoderConfig::default()
+            .with_width(64)
+            .with_height(48)
+            .with_quant_type(quant_type)
+            .with_quarter_sample(quarter_sample)
+            .with_b_vops(true);
         let (stream, recons, _stats) = build_ibp(&cfg, 5);
         let decoded = decode_full(&stream);
         assert_frames_match(&decoded, &recons);
@@ -141,12 +137,10 @@ fn ibp_stream_qpel_and_method1_self_decode() {
 
 #[test]
 fn ibp_byte_deterministic() {
-    let cfg = EncoderConfig {
-        width: 64,
-        height: 64,
-        b_vops: true,
-        ..EncoderConfig::default()
-    };
+    let cfg = EncoderConfig::default()
+        .with_width(64)
+        .with_height(64)
+        .with_b_vops(true);
     let (a, _, _) = build_ibp(&cfg, 4);
     let (b, _, _) = build_ibp(&cfg, 4);
     assert_eq!(a, b);
@@ -157,12 +151,10 @@ fn ibp_byte_deterministic() {
 /// co_located_not_coded) — the smallest legal B-VOP.
 #[test]
 fn static_scene_b_vop_is_all_zero_bit() {
-    let cfg = EncoderConfig {
-        width: 48,
-        height: 48,
-        b_vops: true,
-        ..EncoderConfig::default()
-    };
+    let cfg = EncoderConfig::default()
+        .with_width(48)
+        .with_height(48)
+        .with_b_vops(true);
     let (w, h) = (48usize, 48usize);
     let headers = write_configuration_headers(&cfg);
     let pos = headers

@@ -53,6 +53,7 @@
 
 /// Static parameters of the Annex D simulation.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
 pub struct RateControlConfig {
     /// Peak channel rate `Rvol` in bits per second (item 3; the VOL
     /// signals `ceil(bit_rate / 400)` in 400-bit units).
@@ -69,8 +70,28 @@ pub struct RateControlConfig {
     pub initial_qp: u32,
 }
 
+impl RateControlConfig {
+    /// Build a [`RateControlConfig`] from its fields.
+    pub fn new(
+        bit_rate: u64,
+        vbv_buffer_units: u32,
+        occupancy_64: u32,
+        seconds_per_vop: f64,
+        initial_qp: u32,
+    ) -> Self {
+        Self {
+            bit_rate,
+            vbv_buffer_units,
+            occupancy_64,
+            seconds_per_vop,
+            initial_qp,
+        }
+    }
+}
+
 /// The Annex D VBV simulation + reactive quantiser controller.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct RateController {
     cfg: RateControlConfig,
     /// Buffer occupancy in bits immediately **before** the next VOP's
@@ -236,6 +257,7 @@ const B_QP_RATIO: f64 = 1.4;
 /// Per-frame record of a first (analysis) pass: the numbers the
 /// two-pass planner needs to allot the sequence budget exactly.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
 pub struct FrameStat {
     /// Coding class in bitstream order.
     pub class: VopClass,
@@ -256,6 +278,7 @@ impl FrameStat {
 /// coded VOP in bitstream order — with a line-oriented text form for
 /// the registry `stats-file` round trip.
 #[derive(Debug, Clone, Default, PartialEq)]
+#[non_exhaustive]
 pub struct FirstPassStats {
     /// One record per coded VOP, bitstream order.
     pub frames: Vec<FrameStat>,
@@ -325,6 +348,7 @@ impl FirstPassStats {
 /// The plan of one VOP: the quantiser to seed it with and the bit
 /// budget its macroblock layer must land on.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
 pub struct VopPlan {
     /// `vop_quant` (1..=31).
     pub qp: u32,
@@ -486,34 +510,33 @@ impl BudgetPlanner {
             self.left = self.gop_counts();
         }
         let idx = class.index();
-        if class == VopClass::B {
-            if let Some((remaining, pending)) = self.prev_gop {
-                if pending > 0 {
-                    // A B-VOP owed by the previous GOP: an equal split
-                    // of what that GOP has left.
-                    self.current_prev = true;
-                    let target = (remaining / f64::from(pending))
-                        .min(occupancy * 0.9)
-                        .min(buffer_bits * 0.9)
-                        .max(self.bits_per_frame * 0.05)
-                        .max(64.0);
-                    let qp = match self.two_pass_qp(class, target) {
-                        Some(q) => q,
-                        None => match self.complexity[idx] {
-                            Some(x) => (x / target).round(),
-                            None => f64::from(self.seed_qp(class)),
-                        },
-                    };
-                    let last = f64::from(self.last_qp[idx]);
-                    let qp = qp.clamp(last - 4.0, last + 4.0).clamp(1.0, 31.0) as u32;
-                    let plan = VopPlan {
-                        qp,
-                        target_bits: target.round() as u32,
-                    };
-                    self.current = Some((class, plan));
-                    return plan;
-                }
-            }
+        if class == VopClass::B
+            && let Some((remaining, pending)) = self.prev_gop
+            && pending > 0
+        {
+            // A B-VOP owed by the previous GOP: an equal split
+            // of what that GOP has left.
+            self.current_prev = true;
+            let target = (remaining / f64::from(pending))
+                .min(occupancy * 0.9)
+                .min(buffer_bits * 0.9)
+                .max(self.bits_per_frame * 0.05)
+                .max(64.0);
+            let qp = match self.two_pass_qp(class, target) {
+                Some(q) => q,
+                None => match self.complexity[idx] {
+                    Some(x) => (x / target).round(),
+                    None => f64::from(self.seed_qp(class)),
+                },
+            };
+            let last = f64::from(self.last_qp[idx]);
+            let qp = qp.clamp(last - 4.0, last + 4.0).clamp(1.0, 31.0) as u32;
+            let plan = VopPlan {
+                qp,
+                target_bits: target.round() as u32,
+            };
+            self.current = Some((class, plan));
+            return plan;
         }
         if self.left[idx] == 0 {
             // A truncated GOP at flush: extend the budget by one frame.
@@ -707,15 +730,15 @@ impl BudgetPlanner {
             self.left[idx] = self.left[idx].saturating_sub(1);
         }
         self.spent += bits as f64;
-        if let Some((stats, next, planned_ahead)) = self.plan.as_mut() {
-            if let Some(rec) = stats.frames.get(*next) {
-                if rec.class == class {
-                    *planned_ahead -= rec.complexity() / Self::class_ratio(class);
-                    *next += 1;
-                } else {
-                    // Structure mismatch: abandon the plan.
-                    *next = stats.frames.len();
-                }
+        if let Some((stats, next, planned_ahead)) = self.plan.as_mut()
+            && let Some(rec) = stats.frames.get(*next)
+        {
+            if rec.class == class {
+                *planned_ahead -= rec.complexity() / Self::class_ratio(class);
+                *next += 1;
+            } else {
+                // Structure mismatch: abandon the plan.
+                *next = stats.frames.len();
             }
         }
     }

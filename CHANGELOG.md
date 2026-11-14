@@ -8,6 +8,72 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Integer row–column inverse transform ("variant RC")** —
+  `variant_rc::variant_rc_raw` / `variant_rc::idct_8x8_variant_rc`,
+  the 16-bit-oriented fixed-point 8×8 inverse transform specified in
+  `docs/video/mpeg4-visual/integer-idct-ecosystem-variant.md`: the row
+  pass accumulates one fixed-point basis vector per non-zero input over
+  eight independent 32-bit lanes (multiplier sets and per-row rounding
+  terms of §4.1, 11-bit floor shift, 16-bit truncation), the column
+  pass is the tangent-rotation factorisation of §5 with floor shifts
+  and 32-bit wrapping products; the "empty row" rule keeps a row 0 of
+  `(−4, 0, …, 0)` in place. Reproduces all 64 staged black-box vectors
+  (`tests/variant_rc_vectors.rs`, vendored
+  `tests/fixtures/integer-idct-vectors/vectors.txt`) plus every worked
+  example of the document; a transcription of the printed equations
+  with both rules cross-checks the lane evaluation on 60 000 blocks
+  over the legal, the full 16-bit and the saturating input ranges.
+
+- **Inverse-transform selection** — the decoder can reconstruct
+  texture with the integer row–column transform, chosen per the
+  standing "specification default, ecosystem behaviour opt-in" rule.
+  - `compat::InverseTransformSelection` (`Exact` / `VariantRc` /
+    `FromStream`, `#[non_exhaustive]`);
+    `DecodeOptions::inverse_transform: Option<_>` with
+    `DecodeOptions::with_inverse_transform` and
+    `DecodeOptions::inverse_transform_selection`. Unset follows the
+    mode: the literal-spec decode is `Exact` and **never switches on
+    stream content**; `ecosystem_compat` is `FromStream`. A set value
+    forces that selection in either mode.
+  - `FromStream`: a user-data unit whose payload begins with `XviD`
+    immediately followed by a decimal digit run (the build number; a
+    run that overflows 32 bits is no match) switches the decoder to
+    variant RC for every texture block decoded afterwards — intra /
+    inter, luminance / chrominance, I-/P-/B-/S(GMC)-VOPs and the
+    static-sprite I-VOP, combined and data-partitioned syntax,
+    progressive and interlaced. Sticky for the decoder's life: a later
+    non-matching unit, a repeated configuration header or a registry
+    `reset()` does not revert it. Short-header pictures keep the exact
+    transform; mismatch control and the other compat behaviours keep
+    their own switches.
+  - `Mpeg4VideoDecoder::detected_encoder_build() -> Option<u32>` and
+    `Mpeg4VideoDecoder::active_inverse_transform()` (also on
+    `Mpeg4PacketDecoder`) report the evidence and the transform in
+    effect; the build number is reported in every mode.
+  - Registry: `Mpeg4DecoderOptions::inverse_transform` /
+    `with_inverse_transform`, option key `inverse-transform` =
+    `exact` | `variant-rc` | `from-stream`.
+  - `tests/inverse_transform_selection.rs` runs the whole committed
+    corpus (56 streams, both modes) signed and unsigned: unsigned and
+    literal-spec decodes are byte-identical to before, the signed
+    compat decode equals the forced-variant decode, every stream's
+    variant decode differs from its exact decode by at most 1 level on
+    the intra picture and 3 overall.
+
+- Inverse-transform selection, follow-ups: the `stream_decode` fuzz
+  target rotates its decode options over both modes and the forced
+  selections, decodes every input behind a signed user-data unit and
+  feeds the raw bytes as a user-data payload (signature rule checked
+  against an independent reading; the literal-spec decoder asserted to
+  stay on the exact transform); `benches/throughput.rs` takes
+  `MPEG4VIDEO_BENCH_COMPAT` / `MPEG4VIDEO_BENCH_INVERSE_TRANSFORM`;
+  README "Compatibility modes" documents the selection, what is and is
+  not verified (no encoder of the signing family was available for a
+  black-box stream check), and the measured cost (existing paths
+  unchanged, variant RC 30 ns per dense block against 172 ns exact).
+
+### Added
+
 - `Decoder::output_video_dimensions` / `output_pixel_format`: the visible
   size of the frame last returned (the VOL's
   `video_object_layer_width` × `_height`, or a short-header picture's
@@ -39,6 +105,177 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 - A `vop_time_increment` width derived from a VOP whose header does not
   fit its VOL's holds for the VOPs after it, as in FFmpeg (FATE
   `demo.m4v` decodes past its first P-VOP).
+
+### Changed
+
+- The inverse-transform selection gains `InverseTransformSelection::Simple`
+  (`BlockTransform::Simple`, registry `inverse-transform=simple`):
+  FFmpeg's integer simple IDCT at 8 bits per pixel, put semantics on
+  intra blocks and add semantics on inter residuals. It is what an
+  unset selection resolves to — in the literal-spec mode, and under
+  ecosystem-compat (`FromStream`) until the `XviD` signature switches
+  to variant RC — so streams decode as they did before the selection
+  existed here. `Exact` (`inverse-transform=exact`) selects the Annex
+  A.1 transform with the mode's half-integer rule;
+  `BlockTransform::apply_inter` is the inter-residual form.
+- `Decoder::output_pixel_format` answers `Yuv420P` before the first
+  frame (no Simple Studio Profile stream in sight) and the returned
+  frame's layout afterwards.
+- `Decoder::reset` in ecosystem-compat keeps the coded-order output
+  setting together with the headers.
+
+## [0.1.10](https://github.com/OxideAV/oxideav-mpeg4video/compare/v0.1.9...v0.1.10) - 2026-11-10
+
+### Other
+
+- interlaced hot paths — row-wise field mc, bounded field SAD, byte SAD kernel
+- second hot-path pass — vector FIR rows, column-parallel IDCT, bounded SAD, luma-only B candidate scoring; README performance table
+- basic static sprites end-to-end — decoder sprite memory + trajectory-only S-VOP warps, encoder static-sprite VOL with fitted trajectories
+- decode / encode hot paths — separable qpel cascade, row-wise half-sample MC and SAD, word bit reader, Tcoef lookup
+- erratum E4 — field motion-vector vertical range in field units, decoder + encoder
+- API hygiene: #[non_exhaustive] on error enums and config / stats records
+
+### Added
+
+- **Basic static sprites** (§7.8, `sprite_enable == "static"`,
+  `low_latency_sprite_enable == 0`), decoder and encoder.
+  - Decoder: the initial I-VOP of a static-sprite VOL is
+    reconstructed on the sprite's macroblock grid
+    (`sprite_width × sprite_height`) into the §7.8.2 sprite memory and
+    not displayed; every S-VOP (`sprite_trajectory()` +
+    `brightness_change_factor()`, no macroblock data) is rebuilt by the
+    §7.8.4 / §7.8.5 / §7.8.6 warp — 0..=3 points through the affine
+    family, 4 through the perspective transform, all four warp
+    accuracies, luminance-only brightness change. The packet decoder's
+    `max_pixels_per_frame` cap covers the sprite memory. Low-latency
+    sprites stay a typed rejection.
+  - Encoder: `EncoderConfig::with_static_sprite(StaticSpriteVol)`
+    emits the static VOL (Main profile / Main object type);
+    `sprite_encode::StaticSpriteEncoder` codes the sprite I-VOP and
+    trajectory-only S-VOPs with fitted or caller-supplied
+    trajectories; registry options `static-sprite` and
+    `sprite-points` (first frame = sprite).
+  - `tests/static_sprite.rs`: pan over a panorama recovered exactly,
+    known affine warp fitted, every warp class sample-exact against
+    the closed loop, registry round trip, hostile-stream checks. Fuzz:
+    `stream_decode` drives trajectory-only S-VOPs behind real sprite
+    heads; `encode_roundtrip` picks static-sprite VOLs.
+
+- Erratum E4 (field motion-vector vertical range in **field** units)
+  pinned against the staged `interlaced-field-mv-range` fixture set:
+  `tests/field_mv_range.rs` decodes both I-P-P streams (`vop_fcode` 1
+  and 2) bit-exact in both decode modes and replays the 134-row
+  per-vector trace through `reconstruct_field_motion_vectors_wrapped`
+  (24 rows where a frame-unit reduction would differ, 4 where an
+  unreduced sum would).
+- `FieldPmvBank::with_fcodes`: the interlaced B-VOP four-PMV bank
+  reduces every reconstructed **field** vector into the Table 7-9
+  range of its direction's `vop_fcode` — horizontal in frame units,
+  vertical in field units before the doubling (§7.6.3 general process;
+  erratum E4 units). The B-VOP decode driver and the interlaced B
+  encoder use it; `FieldPmvBank::new` keeps the plain §7.6.8 add.
+  Black-box-confirmed on an encoder-produced stream with 26 reduced
+  B field sums (`enc_ilaced_fieldrange_ipbb_64x160`, bit-exact).
+
+- `with_*` setters for every field of `EncoderConfig`, `ResilienceConfig`,
+  `VopInterlaceFlags`, `DecodeOptions` and `Mpeg4DecoderOptions`, plus
+  `RateControlConfig::new(..)` and `MbBudget::new(target_bits, band)`.
+
+### Fixed
+
+- The stream decoder declines the VOPs of an N-bit VOL (`not_8_bit`
+  with `bits_per_pixel != 8`) with a typed error instead of clipping
+  them into its 8-bit picture store.
+
+### Changed
+
+- `Mpeg4EncoderOptions` is `#[non_exhaustive]` (it grows with every
+  encoder tool — `static_sprite` / `sprite_points` this time); build
+  it with `Default` or through the options bag.
+- Performance (output bit-identical — corpus pins, committed encoder
+  fixtures and the bench hashes unchanged): §7.6.2.2 quarter-sample
+  prediction evaluates the Figure 7-32 cascade separably per block
+  (one horizontal pass per interior row, one vertical pass per output
+  row, fixed-width row loops) instead of re-deriving every tap of every
+  sample; §7.6.2.1 half-sample prediction and the encoder's full-pel
+  SADs run on whole plane rows when the block needs no §7.6.4 clamp;
+  the bit reader extracts fields from a 64-bit window; Tables
+  B.16 / B.17 decode through a 12-bit direct lookup; the Annex A.1
+  transform skips zero inputs and advances its eight accumulators
+  together in both passes (same terms, same order); the method-2
+  inverse quantiser hoists its quantiser terms and skips zero rows;
+  the encoder's full-pel SAD stops once a partial sum can no longer
+  win, and B-VOP mode candidates are scored on a luminance-only
+  prediction; the §7.7.2.1 field `mc` routine and the field SADs take
+  the same whole-row paths, with a byte SAD kernel for picture
+  sources. Each restructured path is pinned against its defining
+  per-sample form by an exhaustive or randomised unit test.
+- `benches/throughput.rs`: dependency-free decode / encode throughput
+  harness over caller-supplied streams (skips when none is given).
+- Encoder: the §7.7.2.1 / §7.7.2.2 field motion estimator searches the
+  **whole field-unit Table 7-9 range** whatever the predictor is (the
+  differential is coded modulo the range width), and scans the window
+  beyond the dense ±8 with a coarse lattice + dense refinement — a
+  field vector now reaches twice the frame-line distance of a frame
+  vector (15 field lines under `fcode == 1`). Streams with fast
+  vertical field motion shrink (`enc_isb_ilaced_gmc_compat_96x64`:
+  4690 → 4611 bytes, regenerated, reference decode still bit-exact).
+
+- API hygiene: `#[non_exhaustive]` on the crate `Error` and every
+  public parse / decode error enum (`VolParseError`, `VopParseError`,
+  `VopDecodeError`, `StreamDecodeError`, `FrameDecodeError`,
+  `FrameStoreError`, `MacroblockParseError`, `BVopMbParseError`,
+  `BVopMvDriverError`, `MotionParseError`, `DirectMvError`,
+  `TextureParseError`, `InverseScanError`, `BlockAssemblyError`,
+  `VideoPacketParseError`, `DataPartitionError`, `ChromaMvError`,
+  `MvGridError`, `PvopMvError`, `VectorPaddingError`,
+  `SpriteTrajectoryError`, `ShortHeaderError`), and on the records
+  `EncoderConfig`, `ResilienceConfig`, `VopInterlaceFlags`,
+  `RateControlConfig`, `RateController`, `MbBudget`, `DecodeOptions`,
+  `Mpeg4DecoderOptions`, `VolHeader`, `ShortHeaderPicture`,
+  `FieldEstimate`, `DcVlcProbe`, `FrameStat`, `VopPlan`,
+  `FirstPassStats` and the per-VOP encode stats (`IVopEncodeStats`,
+  `PVopEncodeStats`, `BVopEncodeStats`, `BVopInterlacedEncodeStats`,
+  `SVopEncodeStats`). Bitstream-fixed enums (`VopCodingType`,
+  `SourceFormat`, `AspectRatio`, `SpriteEnable`,
+  `SpriteWarpingAccuracy`) and fixed VOL sub-records stay exhaustive.
+  No behaviour change.
+
+## [0.1.9](https://github.com/OxideAV/oxideav-mpeg4video/compare/v0.1.8...v0.1.9) - 2026-10-24
+
+### Added
+
+- coded-order output — each VOP's frame from the call that decodes it
+
+### Fixed
+
+- fixup for #16: one anchor-stamp helper, setter docs, reorder-equivalence test, CHANGELOG + README
+- fixup for #15: §7.6.9.5.1 coded-GMC co-located averaged MV is the spec rule, not a compat divergence
+
+### Other
+
+- ecosystem-compat IDCT resolves exact half-integers to the even neighbour
+- Decoder::output_pixel_format states Yuv420P before the first packet
+- Give direct mode the averaged vector of a coded GMC macroblock in compat mode
+- Limit the GMC averaged-MV compat adjustment to half-sample translations
+- edition 2024, MSRV 1.95
+
+### Changed
+
+- edition 2024, MSRV 1.95
+- ecosystem-compat divergence 3 (§7.8.7.3 GMC averaged MV lowered on non-positive components) is scoped to translational warps at half-sample sprite accuracy; zooms, multi-point warps and 1/4–1/16 accuracies follow §7.8.7.3 in both modes (`WarpGeometry::is_translation`)
+
+### Added
+
+- ecosystem-compat IDCT rounding: exact half-integer IDCT results round to the even neighbour (`idct_8x8_rounded` + `HalfIntegerRounding::ToEven`), matching black-box reference decodes on DC-only blocks whose `dc_scaler · QF[0][0] ≡ 4 (mod 8)` (most quantisers above 4); the default keeps §4's away-from-zero rule, now applied to exact halves deterministically (within `1e-8`) rather than by the `f64` evaluation error. Plain reference-encoder AVI: compat decode 270/300 frames identical to the floating-point reference decode (was 5/300); `ties_q6_96x64` pair bit-exact under compat; the interlaced-direct compat envelope drops from 2777 to 380 samples
+
+- `Decoder::output_pixel_format` answers `Yuv420P` before the first packet (Table 6-15's only `chroma_format` and the short-header syntax are 4:2:0; frames are always 8-bit planar), so pipelines need no pre-roll to label the decoder's frames
+
+- coded-order output: `Mpeg4VideoDecoder::set_coded_order_output` / `SequenceDecoder::set_coded_order` return each VOP's frame from the decode call that decodes it (coding order, that call's container pts, §6.3.5 ticks, empty flush) for containers whose presentation times order the frames; the default stays §6.1.3.8 display order
+
+### Fixed
+
+- §7.6.9.5.1 direct mode: a co-located S(GMC) macroblock coded with `mcsel == 1` now supplies its §7.8.7.3 averaged motion vector (it fell back to the zero vector; only skipped GMC macroblocks used the AMV) — default spec mode, ecosystem-compat and the encoder's own reconstruction alike
 
 ## [0.1.8](https://github.com/OxideAV/oxideav-mpeg4video/compare/v0.1.7...v0.1.8) - 2026-09-11
 
@@ -528,7 +765,6 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   edges) across qp {1, 13, 31}, both quantisation methods, partial-
   edge and single-macroblock grids, in I/P/I/P GOPs — every stream
   self-decodes sample-exact against the closed-loop reconstructions.
-
 
 - **P-VOP encoder end-to-end (round 438, stage 6)** — `pvop_encode`:
   §7.6 motion estimation (±8-pel full-search SAD with §7.6.4

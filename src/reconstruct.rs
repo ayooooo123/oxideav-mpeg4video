@@ -133,12 +133,19 @@ pub fn reconstruct_inter_block_8x8_into(
     out: &mut [[i32; BLOCK_SIDE]; BLOCK_SIDE],
 ) {
     let hi = (1i32 << bits_per_pixel) - 1;
-    #[cfg(any(target_arch = "aarch64", all(target_arch = "wasm32", target_feature = "simd128")))]
+    #[cfg(any(
+        target_arch = "aarch64",
+        all(target_arch = "wasm32", target_feature = "simd128")
+    ))]
     {
-        for y in 0..BLOCK_SIDE { crate::simd::add_clip(&mut out[y], &prediction[y], &residual[y], hi); }
-        return;
+        for y in 0..BLOCK_SIDE {
+            crate::simd::add_clip(&mut out[y], &prediction[y], &residual[y], hi);
+        }
     }
-    #[cfg(not(any(target_arch = "aarch64", all(target_arch = "wasm32", target_feature = "simd128"))))]
+    #[cfg(not(any(
+        target_arch = "aarch64",
+        all(target_arch = "wasm32", target_feature = "simd128")
+    )))]
     for y in 0..BLOCK_SIDE {
         for x in 0..BLOCK_SIDE {
             // §7.3 step-2: d[y][x] = p[y][x] + f[y][x].
@@ -207,31 +214,38 @@ pub fn reconstruct_inter_macroblock_into(
     out: &mut ReconstructedMacroblock,
 ) {
     let hi = (1i32 << bits_per_pixel) - 1;
-    #[cfg(any(target_arch = "aarch64", all(target_arch = "wasm32", target_feature = "simd128")))]
+    #[cfg(any(
+        target_arch = "aarch64",
+        all(target_arch = "wasm32", target_feature = "simd128")
+    ))]
     {
-        for y in 0..MACROBLOCK_LUMA_SIDE { crate::simd::add_clip(&mut out.luma[y], &prediction.luma[y], &residual.luma[y], hi); }
+        for y in 0..MACROBLOCK_LUMA_SIDE {
+            crate::simd::add_clip(&mut out.luma[y], &prediction.luma[y], &residual.luma[y], hi);
+        }
         for y in 0..MACROBLOCK_CHROMA_SIDE {
             crate::simd::add_clip(&mut out.cb[y], &prediction.cb[y], &residual.cb[y], hi);
             crate::simd::add_clip(&mut out.cr[y], &prediction.cr[y], &residual.cr[y], hi);
         }
-        return;
     }
-    #[cfg(not(any(target_arch = "aarch64", all(target_arch = "wasm32", target_feature = "simd128"))))]
+    #[cfg(not(any(
+        target_arch = "aarch64",
+        all(target_arch = "wasm32", target_feature = "simd128")
+    )))]
     {
-    for y in 0..MACROBLOCK_LUMA_SIDE {
-        for x in 0..MACROBLOCK_LUMA_SIDE {
-            let d = prediction.luma[y][x] + residual.luma[y][x];
-            out.luma[y][x] = d.clamp(0, hi);
+        for y in 0..MACROBLOCK_LUMA_SIDE {
+            for x in 0..MACROBLOCK_LUMA_SIDE {
+                let d = prediction.luma[y][x] + residual.luma[y][x];
+                out.luma[y][x] = d.clamp(0, hi);
+            }
         }
-    }
-    for y in 0..MACROBLOCK_CHROMA_SIDE {
-        for x in 0..MACROBLOCK_CHROMA_SIDE {
-            let d_cb = prediction.cb[y][x] + residual.cb[y][x];
-            out.cb[y][x] = d_cb.clamp(0, hi);
-            let d_cr = prediction.cr[y][x] + residual.cr[y][x];
-            out.cr[y][x] = d_cr.clamp(0, hi);
+        for y in 0..MACROBLOCK_CHROMA_SIDE {
+            for x in 0..MACROBLOCK_CHROMA_SIDE {
+                let d_cb = prediction.cb[y][x] + residual.cb[y][x];
+                out.cb[y][x] = d_cb.clamp(0, hi);
+                let d_cr = prediction.cr[y][x] + residual.cr[y][x];
+                out.cr[y][x] = d_cr.clamp(0, hi);
+            }
         }
-    }
     }
 }
 

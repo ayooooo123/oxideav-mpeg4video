@@ -41,21 +41,21 @@ use crate::block::nonintra_quant_matrix;
 use crate::data_partition::use_intra_dc_vlc;
 use crate::framestore::{DecodedFrame, FrameStore};
 use crate::ivop_encode::{EncoderConfig, FrameView};
-use crate::motion::{predict_motion_vector, MotionVector};
+use crate::motion::{MotionVector, predict_motion_vector};
 use crate::mv_predictor_grid::MvGrid;
 use crate::neighbour::IntraBlockGrid;
 use crate::packet_encode::{Layout, MbFields, PacketVopInfo, PacketWriter};
 use crate::pvop_encode::{
-    estimate_motion, intra_activity, intra_mb_in_p_fields, sample_mode_of, source_luma_mb,
-    PVopEncodeStats,
+    PVopEncodeStats, estimate_motion, intra_activity, intra_mb_in_p_fields, sample_mode_of,
+    source_luma_mb,
 };
 use crate::pvop_mv::PvopMbMotion;
-use crate::s_gmc_recon::{gmc_prediction_macroblock, GmcReferencePlanes};
+use crate::s_gmc_recon::{GmcReferencePlanes, gmc_prediction_macroblock};
 use crate::sprite::SpriteTrajectory;
 use crate::texture::AcEvent;
 use crate::vol::SpriteWarpingAccuracy;
-use crate::vop::{parse_vop_header_body, vop_time_increment_bits, VopCodingType, VopContext};
-use crate::vop_decode::{gmc_averaged_mv, AnchorMbMotion};
+use crate::vop::{VopCodingType, VopContext, parse_vop_header_body, vop_time_increment_bits};
+use crate::vop_decode::{AnchorMbMotion, gmc_averaged_mv};
 use crate::warp::WarpGeometry;
 
 const VOP_START_CODE: u32 = 0x0000_01B6;
@@ -149,6 +149,7 @@ pub fn write_s_vop_header(
 
 /// Per-VOP S(GMC) encode statistics.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SVopEncodeStats {
     /// `not_coded` GMC copies (implied `mcsel == 1`, zero residual).
     pub gmc_skipped: usize,
@@ -380,22 +381,22 @@ fn fit_trajectory(
         .collect();
     let min_samples = usize::from(points) + 1;
     let mut model = translation;
-    if band.len() >= min_samples {
-        if let Some(first) = fit_global_motion(&band, points) {
-            model = first;
-            let inliers: Vec<_> = samples
-                .iter()
-                .copied()
-                .filter(|&(x, y, dx, dy)| {
-                    let (px, py) = first.displacement(x, y);
-                    (px - dx).abs() <= 1.0 && (py - dy).abs() <= 1.0
-                })
-                .collect();
-            if inliers.len() >= min_samples {
-                if let Some(second) = fit_global_motion(&inliers, points) {
-                    model = second;
-                }
-            }
+    if band.len() >= min_samples
+        && let Some(first) = fit_global_motion(&band, points)
+    {
+        model = first;
+        let inliers: Vec<_> = samples
+            .iter()
+            .copied()
+            .filter(|&(x, y, dx, dy)| {
+                let (px, py) = first.displacement(x, y);
+                (px - dx).abs() <= 1.0 && (py - dy).abs() <= 1.0
+            })
+            .collect();
+        if inliers.len() >= min_samples
+            && let Some(second) = fit_global_motion(&inliers, points)
+        {
+            model = second;
         }
     }
     let half = |v: f64| -> i32 { (2.0 * v).round().clamp(-16000.0, 16000.0) as i32 };
@@ -698,10 +699,10 @@ pub fn encode_s_vop(
                     .expect("grid coordinates in range");
                 let predictor = crate::motion::predict_field_motion_vector(candidates);
                 let top = crate::field_encode::estimate_field_motion(
-                    &src, &luma_ref, mb_x, mb_y, false, predictor, mode, fcode,
+                    &src, &luma_ref, mb_x, mb_y, false, mode, fcode,
                 );
                 let bottom = crate::field_encode::estimate_field_motion(
-                    &src, &luma_ref, mb_x, mb_y, true, predictor, mode, fcode,
+                    &src, &luma_ref, mb_x, mb_y, true, mode, fcode,
                 );
                 (top.sad + bottom.sad + crate::pvop_encode::FIELD_MODE_BIAS < frame_local_sad)
                     .then_some((predictor, top, bottom))
@@ -938,8 +939,8 @@ pub fn encode_s_vop(
 /// advance `store`'s anchor chain, and return the reconstruction plus
 /// the per-macroblock motion the following B-VOPs' §7.6.9.5.1 /
 /// §7.6.9.6 co-located substitution consumes (the same mapping the
-/// stream decoder applies: a skipped GMC macroblock contributes its
-/// averaged MV; a coded GMC or intra macroblock the zero-vector
+/// stream decoder applies: a GMC macroblock, skipped or coded,
+/// contributes its averaged MV; an intra macroblock the zero-vector
 /// fallback).
 pub fn reconstruct_own_s_vop_with_motion(
     vol: &crate::vol::VolHeader,
@@ -1005,15 +1006,10 @@ pub fn reconstruct_own_s_vop_with_anchor_motion(
                 top_ref: *top_field_ref,
                 bottom_ref: *bottom_field_ref,
             },
-            crate::frame_decode::SGmcMbContent::Gmc {
-                amv,
-                not_coded: true,
-                ..
-            } => AnchorMbMotion::Frame(PvopMbMotion::OneMv(*amv)),
-            crate::frame_decode::SGmcMbContent::Gmc {
-                not_coded: false, ..
+            crate::frame_decode::SGmcMbContent::Gmc { amv, .. } => {
+                AnchorMbMotion::Frame(PvopMbMotion::OneMv(*amv))
             }
-            | crate::frame_decode::SGmcMbContent::Intra(_) => {
+            crate::frame_decode::SGmcMbContent::Intra(_) => {
                 AnchorMbMotion::Frame(PvopMbMotion::Intra)
             }
         })

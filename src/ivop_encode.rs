@@ -48,9 +48,9 @@ use crate::neighbour::{BlockNeighbour, IntraBlockGrid};
 use crate::packet_encode::{InterlacedMbInfo, Layout, MbFields, PacketVopInfo, PacketWriter};
 use crate::predictor::{dc_scaler, predict_intra_dc, select_dc_direction};
 use crate::quantise::{quantise_intra_dc, quantise_method1_intra, quantise_method2_intra};
-use crate::scan::{inverse_scan, select_scan_type, DcPredictionDirection, ScanType};
+use crate::scan::{DcPredictionDirection, ScanType, inverse_scan, select_scan_type};
 use crate::texture::{AcEvent, DcComponent};
-use crate::vop::{vop_time_increment_bits, VopCodingType};
+use crate::vop::{VopCodingType, vop_time_increment_bits};
 use crate::vop_decode::decode_i_vop_macroblocks;
 
 /// Start codes the emitters write (§6.2.1 Table 6-3).
@@ -62,6 +62,7 @@ const VOP_START_CODE: u32 = 0x0000_01B6;
 
 /// Static encoder configuration — the fields that shape the VOL.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct EncoderConfig {
     /// Visible luma width in samples (13-bit field, 1..=8191).
     pub width: u16,
@@ -156,16 +157,226 @@ pub struct EncoderConfig {
     /// macroblock's DC differentials ride the AC (Table B.16) VLC
     /// instead of the DC VLC. Default 0 (DC VLC for the whole VOP).
     pub intra_dc_vlc_thr: u8,
+    /// §6.2.3 `sprite_enable == "static"` (basic static sprite,
+    /// `low_latency_sprite_enable == 0`): the VOL declares the sprite
+    /// geometry and warp model, its initial I-VOP is the sprite and
+    /// every other VOP is an S-VOP that only carries a
+    /// `sprite_trajectory()` (see [`crate::sprite_encode`]). Selects
+    /// the Main profile. `None` (default) = no sprite.
+    pub static_sprite: Option<StaticSpriteVol>,
+}
+
+/// The §6.2.3 static-sprite fields of a VOL (basic sprite).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct StaticSpriteVol {
+    /// `sprite_width` (luminance samples, 1..=8191).
+    pub width: u16,
+    /// `sprite_height`.
+    pub height: u16,
+    /// `sprite_left_coordinate` (13-bit signed; §6.3.3 requires it
+    /// to be divisible by two).
+    pub left: i16,
+    /// `sprite_top_coordinate` (13-bit signed, even).
+    pub top: i16,
+    /// `no_of_sprite_warping_points` (Table 6-20): 0 = stationary,
+    /// 1 = translation, 2 / 3 = affine family, 4 = perspective.
+    pub warping_points: u8,
+    /// `sprite_warping_accuracy` (Table 6-21).
+    pub accuracy: crate::vol::SpriteWarpingAccuracy,
+}
+
+impl StaticSpriteVol {
+    /// A sprite of `width × height` at the origin, one warping point,
+    /// half-sample warping accuracy.
+    pub fn new(width: u16, height: u16) -> Self {
+        Self {
+            width,
+            height,
+            left: 0,
+            top: 0,
+            warping_points: 1,
+            accuracy: crate::vol::SpriteWarpingAccuracy::HalfPel,
+        }
+    }
+
+    /// Set the sprite's top-left coordinate.
+    pub fn with_origin(mut self, left: i16, top: i16) -> Self {
+        self.left = left;
+        self.top = top;
+        self
+    }
+
+    /// Set `no_of_sprite_warping_points`.
+    pub fn with_warping_points(mut self, points: u8) -> Self {
+        self.warping_points = points;
+        self
+    }
+
+    /// Set `sprite_warping_accuracy`.
+    pub fn with_accuracy(mut self, accuracy: crate::vol::SpriteWarpingAccuracy) -> Self {
+        self.accuracy = accuracy;
+        self
+    }
+}
+
+impl EncoderConfig {
+    /// Set `static_sprite`.
+    pub fn with_static_sprite(mut self, v: Option<StaticSpriteVol>) -> Self {
+        self.static_sprite = v;
+        self
+    }
+
+    /// Set `width`.
+    pub fn with_width(mut self, v: u16) -> Self {
+        self.width = v;
+        self
+    }
+
+    /// Set `height`.
+    pub fn with_height(mut self, v: u16) -> Self {
+        self.height = v;
+        self
+    }
+
+    /// Set `time_increment_resolution`.
+    pub fn with_time_increment_resolution(mut self, v: u16) -> Self {
+        self.time_increment_resolution = v;
+        self
+    }
+
+    /// Set `quant_type`.
+    pub fn with_quant_type(mut self, v: bool) -> Self {
+        self.quant_type = v;
+        self
+    }
+
+    /// Set `ac_prediction`.
+    pub fn with_ac_prediction(mut self, v: bool) -> Self {
+        self.ac_prediction = v;
+        self
+    }
+
+    /// Set `four_mv`.
+    pub fn with_four_mv(mut self, v: bool) -> Self {
+        self.four_mv = v;
+        self
+    }
+
+    /// Set `quarter_sample`.
+    pub fn with_quarter_sample(mut self, v: bool) -> Self {
+        self.quarter_sample = v;
+        self
+    }
+
+    /// Set `b_vops`.
+    pub fn with_b_vops(mut self, v: bool) -> Self {
+        self.b_vops = v;
+        self
+    }
+
+    /// Set `vbv`.
+    pub fn with_vbv(mut self, v: Option<VbvSignalling>) -> Self {
+        self.vbv = v;
+        self
+    }
+
+    /// Set `fcode`.
+    pub fn with_fcode(mut self, v: u8) -> Self {
+        self.fcode = v;
+        self
+    }
+
+    /// Set `adaptive_quant`.
+    pub fn with_adaptive_quant(mut self, v: bool) -> Self {
+        self.adaptive_quant = v;
+        self
+    }
+
+    /// Set `mb_budget`.
+    pub fn with_mb_budget(mut self, v: Option<crate::mb_quant::MbBudget>) -> Self {
+        self.mb_budget = v;
+        self
+    }
+
+    /// Set `resilience`.
+    pub fn with_resilience(mut self, v: crate::packet_encode::ResilienceConfig) -> Self {
+        self.resilience = v;
+        self
+    }
+
+    /// Set `gmc`.
+    pub fn with_gmc(mut self, v: bool) -> Self {
+        self.gmc = v;
+        self
+    }
+
+    /// Set `gmc_points`.
+    pub fn with_gmc_points(mut self, v: u8) -> Self {
+        self.gmc_points = v;
+        self
+    }
+
+    /// Set `interlaced`.
+    pub fn with_interlaced(mut self, v: bool) -> Self {
+        self.interlaced = v;
+        self
+    }
+
+    /// Set `top_field_first`.
+    pub fn with_top_field_first(mut self, v: bool) -> Self {
+        self.top_field_first = v;
+        self
+    }
+
+    /// Set `alternate_scan`.
+    pub fn with_alternate_scan(mut self, v: bool) -> Self {
+        self.alternate_scan = v;
+        self
+    }
+
+    /// Set `short_header`.
+    pub fn with_short_header(mut self, v: bool) -> Self {
+        self.short_header = v;
+        self
+    }
+
+    /// Set `gob_headers`.
+    pub fn with_gob_headers(mut self, v: bool) -> Self {
+        self.gob_headers = v;
+        self
+    }
+
+    /// Set `intra_dc_vlc_thr`.
+    pub fn with_intra_dc_vlc_thr(mut self, v: u8) -> Self {
+        self.intra_dc_vlc_thr = v;
+        self
+    }
 }
 
 /// The two §6.3.5 interlaced VOP-header flags, written right after
 /// `intra_dc_vlc_thr` when the VOL codes `interlaced == 1`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub struct VopInterlaceFlags {
     /// `top_field_first`.
     pub top_field_first: bool,
     /// `alternate_vertical_scan_flag`.
     pub alternate_vertical_scan: bool,
+}
+
+impl VopInterlaceFlags {
+    /// Set `top_field_first`.
+    pub fn with_top_field_first(mut self, v: bool) -> Self {
+        self.top_field_first = v;
+        self
+    }
+
+    /// Set `alternate_vertical_scan`.
+    pub fn with_alternate_vertical_scan(mut self, v: bool) -> Self {
+        self.alternate_vertical_scan = v;
+        self
+    }
 }
 
 impl VopInterlaceFlags {
@@ -246,6 +457,7 @@ impl Default for EncoderConfig {
             short_header: false,
             gob_headers: true,
             intra_dc_vlc_thr: 0,
+            static_sprite: None,
         }
     }
 }
@@ -286,7 +498,10 @@ impl EncoderConfig {
     /// once an ASP tool (method-1 quantisation, quarter-sample) is
     /// selected.
     pub fn profile_and_level(&self) -> u8 {
-        if self.uses_asp_tools() {
+        if self.static_sprite.is_some() {
+            // Table G.1: Main Profile / Level 2 (the sprite tool).
+            0x32
+        } else if self.uses_asp_tools() {
             0xF3
         } else {
             0x03
@@ -297,7 +512,10 @@ impl EncoderConfig {
     /// Advanced Simple (`0x11`), matching
     /// [`Self::profile_and_level`].
     pub fn video_object_type(&self) -> u8 {
-        if self.uses_asp_tools() {
+        if self.static_sprite.is_some() {
+            // Table 6-11: Main Object Type.
+            0x04
+        } else if self.uses_asp_tools() {
             0x11
         } else {
             0x01
@@ -401,7 +619,47 @@ pub fn write_configuration_headers(cfg: &EncoderConfig) -> Vec<u8> {
     }
     bw.write_bit(cfg.interlaced); // interlaced
     bw.write_bit(true); // obmc_disable = 1
-    if cfg.verid2() {
+    if let Some(sprite) = cfg.static_sprite {
+        assert!(
+            !cfg.gmc && !cfg.b_vops && !cfg.interlaced && !cfg.resilience.data_partitioned,
+            "a static-sprite VOL holds one I-VOP and trajectory-only S-VOPs"
+        );
+        assert!(
+            sprite.width > 0
+                && sprite.width < (1 << 13)
+                && sprite.height > 0
+                && sprite.height < (1 << 13),
+            "sprite dimensions are 13-bit fields"
+        );
+        assert!(
+            (-4096..=4095).contains(&sprite.left) && (-4096..=4095).contains(&sprite.top),
+            "sprite coordinates are 13-bit signed fields"
+        );
+        assert!(
+            sprite.left % 2 == 0 && sprite.top % 2 == 0,
+            "sprite coordinates shall be even (§6.3.3)"
+        );
+        assert!(sprite.warping_points <= 4, "Table 6-20: 0..=4 points");
+        // sprite_enable = "static": `1` in the verid-1 one-bit field,
+        // `01` in the two-bit field.
+        if cfg.verid2() {
+            bw.write_bits(0b01, 2);
+        } else {
+            bw.write_bit(true);
+        }
+        bw.write_bits(u32::from(sprite.width), 13);
+        bw.write_marker();
+        bw.write_bits(u32::from(sprite.height), 13);
+        bw.write_marker();
+        bw.write_bits((sprite.left as u32) & 0x1FFF, 13); // simsbf
+        bw.write_marker();
+        bw.write_bits((sprite.top as u32) & 0x1FFF, 13); // simsbf
+        bw.write_marker();
+        bw.write_bits(u32::from(sprite.warping_points), 6);
+        bw.write_bits(sprite.accuracy.to_bits(), 2);
+        bw.write_bit(false); // sprite_brightness_change = 0
+        bw.write_bit(false); // low_latency_sprite_enable = 0 (basic sprite)
+    } else if cfg.verid2() {
         // sprite_enable (verid 2 → 2 bits): 10 = GMC, 00 = not used.
         bw.write_bits(if cfg.gmc { 0b10 } else { 0b00 }, 2);
         if cfg.gmc {
@@ -873,6 +1131,7 @@ pub fn encode_i_vop_elect_thr_full(
 /// running quantiser and its measured cost under the DC VLC and under
 /// the AC VLC (both with the macroblock's own `ac_pred` decision).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct DcVlcProbe {
     /// The quantiser the macroblock was coded with.
     pub qp: u32,
@@ -910,6 +1169,7 @@ pub fn elect_intra_dc_vlc_thr(probe: &[DcVlcProbe]) -> u8 {
 /// Per-VOP I encode statistics (observability for tests and the rate
 /// model).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct IVopEncodeStats {
     /// Macroblocks that carried a `dquant` (`intra+q`).
     pub dquant: usize,
@@ -1268,7 +1528,7 @@ fn decode_own_i_vop(
     mb_height: usize,
 ) -> DecodedFrame {
     use crate::compat::DecodeOptions;
-    use crate::vop::{parse_vop_header_body, VopContext};
+    use crate::vop::{VopContext, parse_vop_header_body};
     let mut br = BitReader::new(unit);
     let sc = br
         .read_bits(32)

@@ -26,6 +26,17 @@ ffmpeg -idct simple -i <name>.m4v -f rawvideo -pix_fmt yuv420p <name>.yuv
 integer transform, then to `-idct simple` when the C-vs-NEON split was
 measured.)
 
+Two fixtures keep another oracle and are decoded with the exact
+transform selected explicitly (`InverseTransformSelection::Exact`):
+`ties_q6_96x64.yuv` is a floating-point (`-idct faani`) decode — the
+half-integer tie rule is what it pins — and `field_mv_range_fcode{1,2}.yuv`
+are the staged set's own decodes. The encoder fixtures
+`enc_ilaced_fieldrange_ipbb_64x160`, `enc_ilaced_rcbudget_compat_96x64`,
+`enc_isb_dcvlc7_hec_96x64` and `enc_isb_ilaced_gmc_compat_96x64` were
+re-emitted by the encoder and re-decoded with `-idct simple`
+(ffmpeg 9.0.2) on 2026-11-13, when the two lines of development that
+had each changed them were merged.
+
 Two caveats measured against this oracle (see `tests/conformance.rs`
 for the per-stream consequences):
 
@@ -400,6 +411,40 @@ on these pairs, conformance corpus unchanged):
   `mc` routine already did; the quarter-sample field view previously
   clamped within the field.
 
+## Field-vector range set (erratum E4)
+
+`field_mv_range_fcode{1,2}.m4v` / `.yuv` and `field_mv_range_trace.csv`
+are byte copies of the staged
+`docs/video/mpeg4-visual/fixtures/interlaced-field-mv-range/` set
+(`fcode{1,2}.m4v`, `fcode{1,2}.expected.yuv`, `field-mv-trace.csv`;
+generation and oracle described in that directory's `notes.md`): two
+352×288 interlaced I-P-P streams (`vop_fcode_forward` 1 and 2) whose
+forced field vectors sit on, at and beyond the frame-unit Table 7-9
+boundary, the decode obtained when the §7.6.3 reduction is applied to
+`Py / 2 + MVDy` in **field** units before the §7.7.2.1 doubling
+(equal to the producing encoder's own reconstruction), and the
+per-field-vector trace of predictor, differential and the vector each
+candidate reading yields. `tests/field_mv_range.rs` decodes both
+streams bit-exact (both decode modes) and replays all 134 trace rows
+through the field reconstruction. A black-box decode of the two
+streams (`ffmpeg -idct faani …`) is byte-identical to the staged
+expected output.
+
+* `enc_ilaced_fieldrange_ipbb_64x160` — encoder-side pin of the same
+  rule (deterministic from `tests/encoder_interlaced.rs`; `interlaced`,
+  `bf 2`, `fcode 2`, qp 4, ecosystem-compat emission): fields moving 9
+  field lines per frame in opposite directions, the right half
+  mirrored. P field vectors reach 27 field lines (108 frame
+  half-samples; the frame-unit bound is 63), B field vectors pass
+  through the four-PMV bank with 26 reconstructions whose field-unit
+  sum leaves `[low:high]` and is reduced. The reference decode is
+  **bit-exact**, log clean — the §7.6.3 reduction of a B-VOP field
+  vector is a field-unit reduction as well.
+
+```
+ffmpeg -idct simple -i enc_ilaced_fieldrange_ipbb_64x160.m4v -f rawvideo -pix_fmt yuv420p enc_ilaced_fieldrange_ipbb_64x160.yuv
+```
+
 ## Interlaced S(GMC) stream (round 455)
 
 * `enc_isb_ilaced_gmc_compat_96x64` — registry build (`interlaced`,
@@ -412,10 +457,16 @@ on these pairs, conformance corpus unchanged):
   the S anchors' field motion (compat emission — no interlaced direct).
   The reference decode is **bit-exact**, log clean — the reference
   decoder also reads `dct_type` on a coded `mcsel == 1` macroblock, the
-  §6.3.6.3 reading this crate's parser now follows.
+  §6.3.6.3 reading this crate's parser now follows. Regenerated in
+  round 480 once the encoder's reconstruction gave coded `mcsel == 1`
+  co-located macroblocks their §7.6.9.5.1 averaged MV: the pair now
+  pins that rule (the zero-vector reading misses B-VOP samples by up
+  to 146). Regenerated again once the field estimator searched the
+  full field-unit Table 7-9 range (erratum E4): 4611 bytes (was 4690),
+  reference decode still bit-exact.
 
 ```
-ffmpeg -idct faani -i enc_isb_ilaced_gmc_compat_96x64.m4v -f rawvideo -pix_fmt yuv420p enc_isb_ilaced_gmc_compat_96x64.yuv
+ffmpeg -idct simple -i enc_isb_ilaced_gmc_compat_96x64.m4v -f rawvideo -pix_fmt yuv420p enc_isb_ilaced_gmc_compat_96x64.yuv
 ```
 
 ## Multi-point GMC streams (round 455 — §7.8.4 two / three warping points)
@@ -453,10 +504,12 @@ reference decodes as above (`ffmpeg -idct faani -i <name>.m4v …`):
   reference decoder logs an `untested` notice while consuming the
   S-VOP packet HEC bodies (its own path-coverage remark — the pair
   without S-VOP HEC bodies decodes silently), yet reconstructs every
-  sample identically.
+  sample identically. Regenerated in round 480 for the §7.6.9.5.1
+  coded-GMC co-located averaged MV (the zero-vector reading misses
+  the B-VOPs by up to 184 per sample).
 
 ```
-ffmpeg -idct faani -i enc_isb_dcvlc7_hec_96x64.m4v -f rawvideo -pix_fmt yuv420p enc_isb_dcvlc7_hec_96x64.yuv
+ffmpeg -idct simple -i enc_isb_dcvlc7_hec_96x64.m4v -f rawvideo -pix_fmt yuv420p enc_isb_dcvlc7_hec_96x64.yuv
 ```
 
 ## Short-header streams (round 455 — §6.2.5.2 `short_video_header == 1`)
@@ -514,7 +567,7 @@ directions inside every VOP.
 ```
 ffmpeg -idct faani -i enc_ipb_rcbudget_96x64.m4v -f rawvideo -pix_fmt yuv420p enc_ipb_rcbudget_96x64.yuv
 ffmpeg -idct faani -i enc_ipb_rc2pass_96x64.m4v -f rawvideo -pix_fmt yuv420p enc_ipb_rc2pass_96x64.yuv
-ffmpeg -idct faani -i enc_ilaced_rcbudget_compat_96x64.m4v -f rawvideo -pix_fmt yuv420p enc_ilaced_rcbudget_compat_96x64.yuv
+ffmpeg -idct simple -i enc_ilaced_rcbudget_compat_96x64.m4v -f rawvideo -pix_fmt yuv420p enc_ilaced_rcbudget_compat_96x64.yuv
 ```
 
 ## S(GMC) + data partitioning (round 458 — black-box observation, no pair)
@@ -532,13 +585,37 @@ B-VOPs change nothing). No reference decode is therefore committed
 for the combination; the crate keeps the printed syntax on both sides
 and validates it through its own decoder walk.
 
+## IDCT half-integer rounding (round 480)
+
+* `ties_q6_96x64` — plain reference-encoder stream at `-qscale:v 6`
+  (I P P P P I P P P P). At this quantiser the luminance `dc_scaler`
+  is 12 (Table 7-1), so every DC-only block with an odd `QF[0][0]`
+  reconstructs `F[0][0] / 8` to an exact half-integer. The reference
+  decode resolves those halves to the even neighbour, the default
+  decode away from zero (both inside the Annex A tolerance): the
+  ecosystem-compat decode is **bit-exact**, the default one differs on
+  8262 samples, every one by exactly 1 (`tests/conformance.rs`
+  `compat_idct_rounds_exact_halves_to_even`).
+
+```
+ffmpeg -f lavfi -i testsrc2=s=96x64:r=25 -frames:v 10 -c:v mpeg4 -g 5 -bf 0 -qscale:v 6 -f m4v ties_q6_96x64.m4v
+ffmpeg -idct faani -i ties_q6_96x64.m4v -f rawvideo -pix_fmt yuv420p ties_q6_96x64.yuv
+```
+
 ## SHA-256
 
 ```
-3a5d76db248dd883f83483583021b81b232a874cefd7291f193cf5960bf76eb2  enc_isb_ilaced_gmc_compat_96x64.m4v
-d53ad223d6821207ddfb50d4dcce23153f93b4c640158cf1a74e2f1f28fa1674  enc_isb_ilaced_gmc_compat_96x64.yuv
-c0b9105c0f423dc536f4808600836c4aad64bbcafcf65691da41b826ead2eee1  enc_isb_dcvlc7_hec_96x64.m4v
-e5174ea5ec489b9dae7fd9043294bf06585dbd0763b6bc9d0cdc1d9c2f3aa10b  enc_isb_dcvlc7_hec_96x64.yuv
+9601d74596ceb277f6fcdcb4ea6bdfc9e28c782c21361f94b6bac8ab70feb7c0  enc_isb_ilaced_gmc_compat_96x64.m4v
+6a013156d148e7de6baa42c1295770864c845d9ed8f9c35234448831c24cc00d  enc_isb_ilaced_gmc_compat_96x64.yuv
+7a0a2c2f843abfcff70496eb941bb5e46c48d8e820928c22dde2e3be6ee46ea3  enc_ilaced_fieldrange_ipbb_64x160.m4v
+aeb69721896f7b743752f2ad472f15e9dd0d4062613cea178f6103e6038cf66f  enc_ilaced_fieldrange_ipbb_64x160.yuv
+41adcc96bbe4a15a873d65f7fb59a8d6cccb6285db7998744a5c29d1b3f3a5f9  field_mv_range_fcode1.m4v
+e069aca5cee1846ef2f50b7d4e121f11bc3dd97eec4a2968dcac531dc2daf412  field_mv_range_fcode1.yuv
+50a58e7c05fc7fe780038943dbab8fd2dff762ffdbe87e72b76926d56834a0e9  field_mv_range_fcode2.m4v
+f8d051fbf7abd41e1d16e76ee900f9b15cc5c290b610a700b830026b7eac9283  field_mv_range_fcode2.yuv
+f0fd66621b8553d5bf78a9d8e307b5508e722f81689179916def8ad7a815b821  field_mv_range_trace.csv
+25b42cd17682bb06c8b92d322cceda37f1f601a9b0c9d50467f41be897e54dc8  enc_isb_dcvlc7_hec_96x64.m4v
+e117e7b26c8655f2e004d62712bc9d48e570176daaa4faf4703bdef671383571  enc_isb_dcvlc7_hec_96x64.yuv
 1b3f275670116b291b656d64a6649ebd7bff87a9bb169ac5ea045ce9c5ed1777  enc_is_gmc3_zoom_96x64.m4v
 2f0677e7da0fd2a0b743dc098e6931ebb53dc93c1e49e7e7688adbcd89ab3e1b  enc_is_gmc3_zoom_96x64.yuv
 ef61f2af0ce809fab9332d8fba8419d7751c0ba99f84b7b6bbdc47b28eac6483  enc_is_gmc2_rot_96x64.m4v
@@ -656,10 +733,25 @@ f958498a6b00db8595f0be1c28f77e042f8e7c4ef8fc863bb0b05537d76c30a0  enc_ip_dp_aq_9
 466c091493690e78ea864774f940cc4425c7a0c0fc1be06fafd364dcf0080f6b  enc_ipb_rcbudget_96x64.yuv
 22b82d3e4bd90eaf6a22b52cdcca8f1da04f49edabb638af5b3cae680bd3f1ec  enc_ipb_rc2pass_96x64.m4v
 ff158355952caa09f49da26d6cd2921047cc978e6d8f15bbd4f1fccc413bcd7c  enc_ipb_rc2pass_96x64.yuv
-c407e135be4af439fe00668e2f834d25926206712160905ef2d761e1218e3c33  enc_ilaced_rcbudget_compat_96x64.m4v
-12820f2bd515910304cf3aea92d2dfbff60d8aebb48b47133261657b8293a740  enc_ilaced_rcbudget_compat_96x64.yuv
+070e84dedb47d164fa776381bf35c24f4354f2cc177b4a56046c3ef39f4d0510  enc_ilaced_rcbudget_compat_96x64.m4v
+6a960c98301c42fcba76889fafa9fe12c04a2c86c3adb1319e373a7910c2729b  enc_ilaced_rcbudget_compat_96x64.yuv
+b7ea047a2b675e23c06baf2dfc6f00cc60fa105f37b89bd609c5578e3888c854  ties_q6_96x64.m4v
+aadaa7fd85f1455ad6a5a75a416c41b1906db567393439151a55803d9c699154  ties_q6_96x64.yuv
 ```
 
 (Note: `aic_ipb_64x64.yuv` and `altscan_ipb_64x64.yuv` are
 byte-identical — the two encodes quantise the same source to the same
 reconstruction — as are the two interlaced-intra decodes.)
+
+## `integer-idct-vectors/vectors.txt`
+
+Byte-for-byte copy of the staged
+`docs/video/mpeg4-visual/fixtures/integer-idct-vectors/vectors.txt`
+(format and block classes in that directory's `notes.md`): 64
+input / expected-output block pairs of the integer row–column inverse
+transform, black-box input/output data, raw 16-bit results without
+output saturation. Consumed by `tests/variant_rc_vectors.rs`.
+
+```
+b55e863cd3367a77496f95cc9aa57a171eaa89edd6bc6c4cf696dc2efc5da45e  integer-idct-vectors/vectors.txt
+```

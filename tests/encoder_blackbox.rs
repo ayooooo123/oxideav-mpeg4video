@@ -19,7 +19,7 @@
 use oxideav_mpeg4video::decoder::Mpeg4VideoDecoder;
 use oxideav_mpeg4video::framestore::FrameStore;
 use oxideav_mpeg4video::ivop_encode::{
-    encode_i_vop, write_configuration_headers, EncoderConfig, FrameView,
+    EncoderConfig, FrameView, encode_i_vop, write_configuration_headers,
 };
 use oxideav_mpeg4video::pvop_encode::{encode_p_vop, reconstruct_own_p_vop};
 use oxideav_mpeg4video::vol::parse_video_object_layer;
@@ -83,12 +83,10 @@ fn synthesise(frame_index: usize) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
 /// Build the fixture stream: 3 I-VOPs, 64×64, the given quantisation
 /// method, qp 4, resolution 25, cost-decided AC prediction.
 fn build_stream(quant_type: bool) -> Vec<u8> {
-    let cfg = EncoderConfig {
-        width: 64,
-        height: 64,
-        quant_type,
-        ..EncoderConfig::default()
-    };
+    let cfg = EncoderConfig::default()
+        .with_width(64)
+        .with_height(64)
+        .with_quant_type(quant_type);
     let headers = write_configuration_headers(&cfg);
     let pos = headers
         .windows(4)
@@ -147,11 +145,7 @@ fn ip_picture(frame_index: usize) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
 /// Build the I+P fixture stream: 1 I-VOP + 5 P-VOPs, 64×64, method-2
 /// quantisation, qp 4.
 fn build_ip_stream() -> Vec<u8> {
-    let cfg = EncoderConfig {
-        width: 64,
-        height: 64,
-        ..EncoderConfig::default()
-    };
+    let cfg = EncoderConfig::default().with_width(64).with_height(64);
     let headers = write_configuration_headers(&cfg);
     let pos = headers
         .windows(4)
@@ -337,33 +331,27 @@ fn build_tooled_ip_stream(cfg: &EncoderConfig, picture: fn(usize) -> Planes) -> 
 }
 
 fn build_4mv_stream() -> Vec<u8> {
-    let cfg = EncoderConfig {
-        width: 64,
-        height: 64,
-        four_mv: true,
-        ..EncoderConfig::default()
-    };
+    let cfg = EncoderConfig::default()
+        .with_width(64)
+        .with_height(64)
+        .with_four_mv(true);
     build_tooled_ip_stream(&cfg, divergent_picture)
 }
 
 fn build_qpel_stream() -> Vec<u8> {
-    let cfg = EncoderConfig {
-        width: 64,
-        height: 64,
-        quarter_sample: true,
-        ..EncoderConfig::default()
-    };
+    let cfg = EncoderConfig::default()
+        .with_width(64)
+        .with_height(64)
+        .with_quarter_sample(true);
     build_tooled_ip_stream(&cfg, qpel_picture)
 }
 
 fn build_qpel_4mv_stream() -> Vec<u8> {
-    let cfg = EncoderConfig {
-        width: 64,
-        height: 64,
-        four_mv: true,
-        quarter_sample: true,
-        ..EncoderConfig::default()
-    };
+    let cfg = EncoderConfig::default()
+        .with_width(64)
+        .with_height(64)
+        .with_four_mv(true)
+        .with_quarter_sample(true);
     build_tooled_ip_stream(&cfg, divergent_picture)
 }
 

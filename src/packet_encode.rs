@@ -75,6 +75,7 @@ pub(crate) struct InterlacedMbInfo {
 
 /// The VOL-level error-resilience tool selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub struct ResilienceConfig {
     /// Target video-packet size in bits (`0` = no video packets:
     /// `resync_marker_disable == 1`, one packet per VOP).
@@ -84,6 +85,26 @@ pub struct ResilienceConfig {
     /// Reversible VLCs for the data-partitioned texture partition
     /// (`reversible_vlc`; requires `data_partitioned`).
     pub reversible_vlc: bool,
+}
+
+impl ResilienceConfig {
+    /// Set `packet_bits`.
+    pub fn with_packet_bits(mut self, v: u32) -> Self {
+        self.packet_bits = v;
+        self
+    }
+
+    /// Set `data_partitioned`.
+    pub fn with_data_partitioned(mut self, v: bool) -> Self {
+        self.data_partitioned = v;
+        self
+    }
+
+    /// Set `reversible_vlc`.
+    pub fn with_reversible_vlc(mut self, v: bool) -> Self {
+        self.reversible_vlc = v;
+        self
+    }
 }
 
 /// The macroblock-layer layout a [`PacketWriter`] serialises.
@@ -545,7 +566,7 @@ impl PacketWriter {
 mod tests {
     use super::*;
     use crate::bitreader::BitReader;
-    use crate::video_packet::{parse_video_packet_header, VideoPacketContext};
+    use crate::video_packet::{VideoPacketContext, parse_video_packet_header};
 
     fn info(coding_type: VopCodingType) -> PacketVopInfo {
         PacketVopInfo {

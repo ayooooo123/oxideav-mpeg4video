@@ -28,14 +28,15 @@ use crate::block::InterMacroblock;
 use crate::bvop_mv::{BVopAnchorPlanes, BVopMbTexturedDecode};
 use crate::bvop_prediction::BVopSampleMode;
 use crate::framestore::{DecodedFrame, FrameStore, FrameStoreError};
-use crate::pvop_mv::{predict_inter_macroblock, reconstruct_pvop_macroblock, PvopMbMotion};
-use crate::reconstruct::{reconstruct_inter_macroblock, ReconstructedMacroblock};
-use crate::s_gmc_recon::{gmc_prediction_macroblock, GmcReferencePlanes};
+use crate::pvop_mv::{PvopMbMotion, predict_inter_macroblock, reconstruct_pvop_macroblock};
+use crate::reconstruct::{ReconstructedMacroblock, reconstruct_inter_macroblock};
+use crate::s_gmc_recon::{GmcReferencePlanes, gmc_prediction_macroblock};
 use crate::vop::VopCodingType;
 use crate::warp::WarpGeometry;
 
 /// Errors raised while assembling a frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum FrameDecodeError {
     /// The reference-frame chain lacked the anchor(s) this VOP type needs
     /// (a P-VOP with no preceding I/P/S-VOP, or a B-VOP missing one of
@@ -82,7 +83,9 @@ const PARALLEL_MIN_MACROBLOCKS: usize = 396;
 const MAX_REBUILD_THREADS: usize = 2;
 /// Threads that rebuild a large frame: the CPU's, up to [`MAX_REBUILD_THREADS`].
 static REBUILD_THREADS: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
-    std::thread::available_parallelism().map_or(1, |n| n.get()).min(MAX_REBUILD_THREADS)
+    std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .min(MAX_REBUILD_THREADS)
 });
 
 /// Rebuilds each macroblock of `frame` from `entries` (raster order) with
@@ -97,8 +100,15 @@ fn rebuild_rows<E: Sync>(
     entries: &[E],
     rebuild: impl Fn(usize, usize, &E) -> Result<ReconstructedMacroblock, FrameDecodeError> + Sync,
 ) -> Result<(), FrameDecodeError> {
-    let mut rows = frame.macroblock_rows_mut().zip(entries.chunks(mb_width)).enumerate();
-    let threads = if entries.len() < PARALLEL_MIN_MACROBLOCKS { 1 } else { *REBUILD_THREADS };
+    let mut rows = frame
+        .macroblock_rows_mut()
+        .zip(entries.chunks(mb_width))
+        .enumerate();
+    let threads = if entries.len() < PARALLEL_MIN_MACROBLOCKS {
+        1
+    } else {
+        *REBUILD_THREADS
+    };
     if threads <= 1 {
         return rows.try_for_each(|(mb_row, (mut row, row_entries))| {
             for (mb_col, entry) in row_entries.iter().enumerate() {
@@ -119,7 +129,7 @@ fn rebuild_rows<E: Sync>(
                 Ok(mb) => row.blit(mb_col, &mb),
                 Err(error) => {
                     let mut first = first_error.lock().unwrap_or_else(|e| e.into_inner());
-                    if first.map_or(true, |(at, _)| mb_row < at) {
+                    if first.is_none_or(|(at, _)| mb_row < at) {
                         *first = Some((mb_row, error));
                     }
                     break;
@@ -129,7 +139,7 @@ fn rebuild_rows<E: Sync>(
     };
     std::thread::scope(|scope| {
         for _ in 1..threads {
-            scope.spawn(&work);
+            scope.spawn(work);
         }
         work();
     });
@@ -383,7 +393,7 @@ pub fn assemble_p_vop_frame_obmc(
     bits_per_pixel: u32,
 ) -> Result<DecodedFrame, FrameDecodeError> {
     use crate::half_sample::{fetch_clamped_sample, split_half_pel};
-    use crate::obmc::{obmc_predict_block, ObmcConfig, ObmcMv, ObmcNeighbourhood};
+    use crate::obmc::{ObmcConfig, ObmcMv, ObmcNeighbourhood, obmc_predict_block};
     use crate::reconstruct::InterPredictionMacroblock;
 
     let expected = mb_width * mb_height;
@@ -732,11 +742,9 @@ pub enum SGmcMbContent {
     /// `mcsel == 1`: global-motion-compensated. The §7.8 warp is applied
     /// to the forward reference plane; the §7.4 residual is carried
     /// together with the macroblock's §7.8.7.3 **averaged motion
-    /// vector** and its skip status, which the §7.6.9.6 co-located
-    /// substitution for a following B-VOP consumes (a *skipped*
-    /// co-located S(GMC) macroblock is treated as non-skipped with the
-    /// AMV; a coded GMC macroblock keeps the §7.6.9.5.1 zero-vector
-    /// fallback).
+    /// vector** and its skip status; the AMV is the co-located vector a
+    /// following B-VOP's direct mode consumes (§7.6.9.5.1 for a coded
+    /// GMC macroblock, §7.6.9.6 for a skipped one).
     Gmc {
         /// The §7.8.7.3 averaged pel-wise warping vector for this
         /// macroblock (VOL-grid units: half-pel, or quarter-pel when

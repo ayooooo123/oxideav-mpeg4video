@@ -55,12 +55,15 @@ pub fn starts_studio(data: &[u8]) -> bool {
             let code = 0x100 | u32::from(data[i + 3]);
             match code {
                 VOS_START_CODE => {
-                    let (profile, level) = (u32::from(data[i + 4] >> 4), u32::from(data[i + 4] & 15));
+                    let (profile, level) =
+                        (u32::from(data[i + 4] >> 4), u32::from(data[i + 4] & 15));
                     return profile == SIMPLE_STUDIO_PROFILE && (1..9).contains(&level);
                 }
                 0x120..=0x12F => {
                     // random_accessible_vol, then video_object_type_indication
-                    let vo_type = (u32::from(data[i + 4]) << 1 | u32::from(data.get(i + 5).copied().unwrap_or(0)) >> 7) & 0xFF;
+                    let vo_type = (u32::from(data[i + 4]) << 1
+                        | u32::from(data.get(i + 5).copied().unwrap_or(0)) >> 7)
+                        & 0xFF;
                     return vo_type == SIMPLE_STUDIO_VO_TYPE || vo_type == CORE_STUDIO_VO_TYPE;
                 }
                 VOP_START_CODE => return false,
@@ -117,7 +120,11 @@ impl<'a> Bits<'a> {
     /// negative).
     fn get_xbits(&mut self, n: usize) -> i32 {
         let v = self.get(n) as i32;
-        if v >> (n - 1) != 0 { v } else { v - ((1 << n) - 1) }
+        if v >> (n - 1) != 0 {
+            v
+        } else {
+            v - ((1 << n) - 1)
+        }
     }
 
     /// get_unary(gb, 1, len): zero bits before a one, at most `len`.
@@ -169,7 +176,8 @@ impl Vlc {
     fn read(&self, gb: &mut Bits<'_>) -> Option<u32> {
         for len in 1..=self.max_len {
             let v = gb.show(len as usize);
-            if let Some(&(_, _, symbol)) = self.codes.iter().find(|&&(l, c, _)| l == len && c == v) {
+            if let Some(&(_, _, symbol)) = self.codes.iter().find(|&&(l, c, _)| l == len && c == v)
+            {
                 gb.skip(len as usize);
                 return Some(u32::from(symbol));
             }
@@ -180,89 +188,388 @@ impl Vlc {
 
 /// ff_mpeg4_studio_dc_luma: (symbol, length)
 const DC_LUMA: [(u8, i8); 19] = [
-    (2, 4), (10, 4), (3, 4), (1, 5), (0, 6), (11, 7), (12, 8), (13, 9), (14, 10), (15, 11), (16, 12), (17, 13),
-    (18, 13), (7, 3), (6, 3), (8, 3), (5, 3), (9, 3), (4, 3),
+    (2, 4),
+    (10, 4),
+    (3, 4),
+    (1, 5),
+    (0, 6),
+    (11, 7),
+    (12, 8),
+    (13, 9),
+    (14, 10),
+    (15, 11),
+    (16, 12),
+    (17, 13),
+    (18, 13),
+    (7, 3),
+    (6, 3),
+    (8, 3),
+    (5, 3),
+    (9, 3),
+    (4, 3),
 ];
 
 /// ff_mpeg4_studio_dc_chroma
 const DC_CHROMA: [(u8, i8); 19] = [
-    (0, 4), (8, 4), (1, 4), (9, 5), (10, 6), (11, 7), (12, 8), (13, 9), (14, 10), (15, 11), (16, 12), (17, 13),
-    (18, 13), (5, 3), (4, 3), (6, 3), (3, 3), (7, 3), (2, 3),
+    (0, 4),
+    (8, 4),
+    (1, 4),
+    (9, 5),
+    (10, 6),
+    (11, 7),
+    (12, 8),
+    (13, 9),
+    (14, 10),
+    (15, 11),
+    (16, 12),
+    (17, 13),
+    (18, 13),
+    (5, 3),
+    (4, 3),
+    (6, 3),
+    (3, 3),
+    (7, 3),
+    (2, 3),
 ];
 
 /// ff_mpeg4_studio_intra
 const INTRA: [&[(u8, i8)]; 12] = [
     &[
-        (0, -6), (21, 13), (6, 13), (5, 12), (4, 11), (20, 10), (3, 9), (12, 8), (11, 7), (10, 7), (2, 7), (19, 6),
-        (18, 6), (9, 6), (8, 5), (17, 4), (7, 4), (1, 4), (0, 4), (16, 3), (15, 3), (14, 3), (13, 2),
-    ],
-    &[(0, -6), (21, 8), (20, 8), (19, 7), (18, 5), (17, 4), (16, 3), (15, 2), (14, 1)],
-    &[
-        (0, -6), (0, -15), (20, 15), (19, 14), (6, 14), (5, 14), (21, 13), (18, 13), (17, 11), (12, 10), (4, 9), (16, 8),
-        (3, 7), (15, 6), (11, 6), (2, 5), (1, 5), (10, 4), (9, 4), (14, 3), (8, 3), (7, 3), (0, 3), (13, 2),
-    ],
-    &[
-        (0, -6), (20, 13), (12, 13), (6, 13), (5, 13), (21, 12), (19, 12), (18, 10), (4, 9), (11, 8), (17, 7), (16, 6),
-        (3, 6), (15, 5), (10, 5), (2, 5), (0, 5), (9, 4), (8, 4), (1, 4), (7, 3), (14, 2), (13, 2),
-    ],
-    &[
-        (0, -6), (0, -15), (12, 15), (6, 14), (21, 13), (20, 13), (5, 13), (19, 11), (11, 10), (4, 9), (18, 8), (10, 7),
-        (3, 7), (0, 7), (17, 6), (16, 6), (9, 6), (2, 5), (8, 4), (1, 4), (15, 3), (7, 3), (14, 2), (13, 2),
-    ],
-    &[
-        (0, -6), (0, -15), (20, 15), (12, 14), (11, 13), (6, 13), (5, 13), (21, 12), (4, 12), (19, 11), (10, 11), (3, 10),
-        (0, 10), (9, 8), (18, 7), (8, 7), (2, 7), (17, 6), (7, 5), (1, 5), (16, 3), (15, 2), (14, 2), (13, 2),
-    ],
-    &[
-        (0, -6), (0, -15), (12, 15), (11, 14), (6, 14), (5, 14), (21, 12), (20, 12), (10, 12), (4, 11), (0, 11), (9, 10),
-        (3, 10), (19, 8), (8, 8), (2, 8), (18, 6), (7, 6), (1, 4), (17, 3), (14, 3), (13, 3), (16, 2), (15, 2),
-    ],
-    &[
-        (0, -6), (12, 12), (6, 12), (21, 11), (11, 11), (5, 11), (20, 10), (10, 10), (9, 9), (0, 9), (8, 8), (2, 8),
-        (19, 7), (7, 7), (4, 7), (3, 7), (18, 5), (1, 5), (14, 4), (13, 4), (17, 2), (16, 2), (15, 2),
+        (0, -6),
+        (21, 13),
+        (6, 13),
+        (5, 12),
+        (4, 11),
+        (20, 10),
+        (3, 9),
+        (12, 8),
+        (11, 7),
+        (10, 7),
+        (2, 7),
+        (19, 6),
+        (18, 6),
+        (9, 6),
+        (8, 5),
+        (17, 4),
+        (7, 4),
+        (1, 4),
+        (0, 4),
+        (16, 3),
+        (15, 3),
+        (14, 3),
+        (13, 2),
     ],
     &[
-        (0, -6), (12, 13), (6, 13), (21, 12), (11, 12), (5, 12), (20, 11), (3, 11), (10, 10), (9, 10), (2, 10), (0, 10),
-        (8, 9), (7, 8), (4, 8), (19, 6), (1, 6), (13, 4), (18, 3), (15, 3), (14, 3), (17, 2), (16, 2),
+        (0, -6),
+        (21, 8),
+        (20, 8),
+        (19, 7),
+        (18, 5),
+        (17, 4),
+        (16, 3),
+        (15, 2),
+        (14, 1),
     ],
     &[
-        (0, -6), (12, 12), (11, 12), (6, 12), (0, 12), (21, 10), (10, 10), (5, 10), (20, 8), (9, 8), (2, 8), (8, 7),
-        (7, 7), (4, 6), (3, 6), (1, 6), (13, 5), (19, 4), (14, 4), (16, 3), (15, 3), (18, 2), (17, 2),
+        (0, -6),
+        (0, -15),
+        (20, 15),
+        (19, 14),
+        (6, 14),
+        (5, 14),
+        (21, 13),
+        (18, 13),
+        (17, 11),
+        (12, 10),
+        (4, 9),
+        (16, 8),
+        (3, 7),
+        (15, 6),
+        (11, 6),
+        (2, 5),
+        (1, 5),
+        (10, 4),
+        (9, 4),
+        (14, 3),
+        (8, 3),
+        (7, 3),
+        (0, 3),
+        (13, 2),
     ],
     &[
-        (0, -6), (12, 13), (6, 13), (5, 13), (0, 13), (4, 11), (11, 10), (21, 9), (10, 9), (9, 9), (8, 8), (2, 8),
-        (7, 7), (1, 7), (20, 6), (14, 5), (13, 5), (15, 4), (3, 4), (17, 3), (16, 3), (19, 2), (18, 2),
+        (0, -6),
+        (20, 13),
+        (12, 13),
+        (6, 13),
+        (5, 13),
+        (21, 12),
+        (19, 12),
+        (18, 10),
+        (4, 9),
+        (11, 8),
+        (17, 7),
+        (16, 6),
+        (3, 6),
+        (15, 5),
+        (10, 5),
+        (2, 5),
+        (0, 5),
+        (9, 4),
+        (8, 4),
+        (1, 4),
+        (7, 3),
+        (14, 2),
+        (13, 2),
     ],
     &[
-        (0, -6), (6, 11), (5, 11), (12, 10), (11, 10), (0, 10), (21, 9), (10, 9), (4, 9), (3, 9), (9, 8), (8, 6),
-        (2, 6), (7, 5), (1, 5), (18, 4), (17, 4), (16, 4), (15, 4), (19, 3), (14, 3), (13, 3), (20, 2),
+        (0, -6),
+        (0, -15),
+        (12, 15),
+        (6, 14),
+        (21, 13),
+        (20, 13),
+        (5, 13),
+        (19, 11),
+        (11, 10),
+        (4, 9),
+        (18, 8),
+        (10, 7),
+        (3, 7),
+        (0, 7),
+        (17, 6),
+        (16, 6),
+        (9, 6),
+        (2, 5),
+        (8, 4),
+        (1, 4),
+        (15, 3),
+        (7, 3),
+        (14, 2),
+        (13, 2),
+    ],
+    &[
+        (0, -6),
+        (0, -15),
+        (20, 15),
+        (12, 14),
+        (11, 13),
+        (6, 13),
+        (5, 13),
+        (21, 12),
+        (4, 12),
+        (19, 11),
+        (10, 11),
+        (3, 10),
+        (0, 10),
+        (9, 8),
+        (18, 7),
+        (8, 7),
+        (2, 7),
+        (17, 6),
+        (7, 5),
+        (1, 5),
+        (16, 3),
+        (15, 2),
+        (14, 2),
+        (13, 2),
+    ],
+    &[
+        (0, -6),
+        (0, -15),
+        (12, 15),
+        (11, 14),
+        (6, 14),
+        (5, 14),
+        (21, 12),
+        (20, 12),
+        (10, 12),
+        (4, 11),
+        (0, 11),
+        (9, 10),
+        (3, 10),
+        (19, 8),
+        (8, 8),
+        (2, 8),
+        (18, 6),
+        (7, 6),
+        (1, 4),
+        (17, 3),
+        (14, 3),
+        (13, 3),
+        (16, 2),
+        (15, 2),
+    ],
+    &[
+        (0, -6),
+        (12, 12),
+        (6, 12),
+        (21, 11),
+        (11, 11),
+        (5, 11),
+        (20, 10),
+        (10, 10),
+        (9, 9),
+        (0, 9),
+        (8, 8),
+        (2, 8),
+        (19, 7),
+        (7, 7),
+        (4, 7),
+        (3, 7),
+        (18, 5),
+        (1, 5),
+        (14, 4),
+        (13, 4),
+        (17, 2),
+        (16, 2),
+        (15, 2),
+    ],
+    &[
+        (0, -6),
+        (12, 13),
+        (6, 13),
+        (21, 12),
+        (11, 12),
+        (5, 12),
+        (20, 11),
+        (3, 11),
+        (10, 10),
+        (9, 10),
+        (2, 10),
+        (0, 10),
+        (8, 9),
+        (7, 8),
+        (4, 8),
+        (19, 6),
+        (1, 6),
+        (13, 4),
+        (18, 3),
+        (15, 3),
+        (14, 3),
+        (17, 2),
+        (16, 2),
+    ],
+    &[
+        (0, -6),
+        (12, 12),
+        (11, 12),
+        (6, 12),
+        (0, 12),
+        (21, 10),
+        (10, 10),
+        (5, 10),
+        (20, 8),
+        (9, 8),
+        (2, 8),
+        (8, 7),
+        (7, 7),
+        (4, 6),
+        (3, 6),
+        (1, 6),
+        (13, 5),
+        (19, 4),
+        (14, 4),
+        (16, 3),
+        (15, 3),
+        (18, 2),
+        (17, 2),
+    ],
+    &[
+        (0, -6),
+        (12, 13),
+        (6, 13),
+        (5, 13),
+        (0, 13),
+        (4, 11),
+        (11, 10),
+        (21, 9),
+        (10, 9),
+        (9, 9),
+        (8, 8),
+        (2, 8),
+        (7, 7),
+        (1, 7),
+        (20, 6),
+        (14, 5),
+        (13, 5),
+        (15, 4),
+        (3, 4),
+        (17, 3),
+        (16, 3),
+        (19, 2),
+        (18, 2),
+    ],
+    &[
+        (0, -6),
+        (6, 11),
+        (5, 11),
+        (12, 10),
+        (11, 10),
+        (0, 10),
+        (21, 9),
+        (10, 9),
+        (4, 9),
+        (3, 9),
+        (9, 8),
+        (8, 6),
+        (2, 6),
+        (7, 5),
+        (1, 5),
+        (18, 4),
+        (17, 4),
+        (16, 4),
+        (15, 4),
+        (19, 3),
+        (14, 3),
+        (13, 3),
+        (20, 2),
     ],
 ];
 
 /// ac_state_tab: (additional_code length, next VLC table) per group.
 const AC_STATE: [(u32, usize); 22] = [
-    (0, 0), (0, 1), (1, 1), (2, 1), (3, 1), (4, 1), (5, 1), (1, 2), (2, 2), (3, 2), (4, 2), (5, 2),
-    (6, 2), (1, 3), (2, 4), (3, 5), (4, 6), (5, 7), (6, 8), (7, 9), (8, 10), (0, 11),
+    (0, 0),
+    (0, 1),
+    (1, 1),
+    (2, 1),
+    (3, 1),
+    (4, 1),
+    (5, 1),
+    (1, 2),
+    (2, 2),
+    (3, 2),
+    (4, 2),
+    (5, 2),
+    (6, 2),
+    (1, 3),
+    (2, 4),
+    (3, 5),
+    (4, 6),
+    (5, 7),
+    (6, 8),
+    (7, 9),
+    (8, 10),
+    (0, 11),
 ];
 
 /// ff_zigzag_direct
 const ZIGZAG: [usize; 64] = [
-    0, 1, 8, 16, 9, 2, 3, 10, 17, 24, 32, 25, 18, 11, 4, 5, 12, 19, 26, 33, 40, 48, 41, 34, 27, 20, 13, 6, 7, 14, 21,
-    28, 35, 42, 49, 56, 57, 50, 43, 36, 29, 22, 15, 23, 30, 37, 44, 51, 58, 59, 52, 45, 38, 31, 39, 46, 53, 60, 61,
-    54, 47, 55, 62, 63,
+    0, 1, 8, 16, 9, 2, 3, 10, 17, 24, 32, 25, 18, 11, 4, 5, 12, 19, 26, 33, 40, 48, 41, 34, 27, 20,
+    13, 6, 7, 14, 21, 28, 35, 42, 49, 56, 57, 50, 43, 36, 29, 22, 15, 23, 30, 37, 44, 51, 58, 59,
+    52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63,
 ];
 
 /// ff_alternate_vertical_scan
 const ALTERNATE_VERTICAL: [usize; 64] = [
-    0, 8, 16, 24, 1, 9, 2, 10, 17, 25, 32, 40, 48, 56, 57, 49, 41, 33, 26, 18, 3, 11, 4, 12, 19, 27, 34, 42, 50, 58,
-    35, 43, 51, 59, 20, 28, 5, 13, 6, 14, 21, 29, 36, 44, 52, 60, 37, 45, 53, 61, 22, 30, 7, 15, 23, 31, 38, 46, 54,
-    62, 39, 47, 55, 63,
+    0, 8, 16, 24, 1, 9, 2, 10, 17, 25, 32, 40, 48, 56, 57, 49, 41, 33, 26, 18, 3, 11, 4, 12, 19,
+    27, 34, 42, 50, 58, 35, 43, 51, 59, 20, 28, 5, 13, 6, 14, 21, 29, 36, 44, 52, 60, 37, 45, 53,
+    61, 22, 30, 7, 15, 23, 31, 38, 46, 54, 62, 39, 47, 55, 63,
 ];
 
 /// ff_mpeg2_non_linear_qscale
 const NON_LINEAR_QSCALE: [i32; 32] = [
-    0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 16, 18, 20, 22, 24, 28, 32, 36, 40, 44, 48, 52, 56, 64, 72, 80, 88, 96,
-    104, 112,
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 16, 18, 20, 22, 24, 28, 32, 36, 40, 44, 48, 52, 56, 64,
+    72, 80, 88, 96, 104, 112,
 ];
 
 /// ff_mpeg4_default_intra_matrix, in raster order.
@@ -305,7 +612,11 @@ struct StudioVol {
 impl StudioVol {
     /// (chroma_x_shift, chroma_y_shift)
     fn chroma_shift(&self) -> (u32, u32) {
-        if self.chroma_format == CHROMA_422 { (1, 0) } else { (0, 0) }
+        if self.chroma_format == CHROMA_422 {
+            (1, 0)
+        } else {
+            (0, 0)
+        }
     }
 }
 
@@ -341,7 +652,9 @@ pub struct StudioDecoder {
 
 impl std::fmt::Debug for StudioDecoder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("StudioDecoder").field("vol", &self.vol).finish()
+        f.debug_struct("StudioDecoder")
+            .field("vol", &self.vol)
+            .finish()
     }
 }
 
@@ -386,7 +699,11 @@ impl StudioDecoder {
     /// One packet: its headers and, from its first VOP, a picture (FFmpeg
     /// shows it now in a low-delay stream, else at the next picture or
     /// the flush).
-    pub fn decode_packet(&mut self, data: &[u8], pts: Option<i64>) -> Result<Vec<StudioFrame>, StreamDecodeError> {
+    pub fn decode_packet(
+        &mut self,
+        data: &[u8],
+        pts: Option<i64>,
+    ) -> Result<Vec<StudioFrame>, StreamDecodeError> {
         let mut gb = Bits::new(data);
         let mut startcode: u32 = 0xFF;
         let mut vol_seen = false;
@@ -438,23 +755,52 @@ impl StudioDecoder {
         let vol = self.vol.ok_or(ERR("VOP before a VOL header"))?;
         self.decode_vop_header(&mut gb);
 
-        let (mb_width, mb_height) = (vol.width.div_ceil(16) as usize, vol.height.div_ceil(16) as usize);
+        let (mb_width, mb_height) = (
+            vol.width.div_ceil(16) as usize,
+            vol.height.div_ceil(16) as usize,
+        );
         let (hsub, vsub) = vol.chroma_shift();
-        let strides = [mb_width * 16, (mb_width * 16) >> hsub, (mb_width * 16) >> hsub];
-        let rows = [mb_height * 16, (mb_height * 16) >> vsub, (mb_height * 16) >> vsub];
+        let strides = [
+            mb_width * 16,
+            (mb_width * 16) >> hsub,
+            (mb_width * 16) >> hsub,
+        ];
+        let rows = [
+            mb_height * 16,
+            (mb_height * 16) >> vsub,
+            (mb_height * 16) >> vsub,
+        ];
         let mut picture = Picture {
-            planes: [vec![0; strides[0] * rows[0]], vec![0; strides[1] * rows[1]], vec![0; strides[2] * rows[2]]],
+            planes: [
+                vec![0; strides[0] * rows[0]],
+                vec![0; strides[1] * rows[1]],
+                vec![0; strides[2] * rows[2]],
+            ],
             strides,
         };
         // ff_h263_decode_frame: the first slice at the reader, then each
         // slice ff_h263_resync finds. A slice that fails ends itself.
         let (mut mb_x, mut mb_y) = (0usize, 0usize);
-        let _ = self.decode_slice(&mut gb, &vol, &mut picture, (mb_width, mb_height), &mut mb_x, &mut mb_y);
+        let _ = self.decode_slice(
+            &mut gb,
+            &vol,
+            &mut picture,
+            (mb_width, mb_height),
+            &mut mb_x,
+            &mut mb_y,
+        );
         while mb_y < mb_height {
             if !resync(&mut gb) {
                 break;
             }
-            let _ = self.decode_slice(&mut gb, &vol, &mut picture, (mb_width, mb_height), &mut mb_x, &mut mb_y);
+            let _ = self.decode_slice(
+                &mut gb,
+                &vol,
+                &mut picture,
+                (mb_width, mb_height),
+                &mut mb_x,
+                &mut mb_y,
+            );
         }
         let frame = crop(picture, &vol, pts);
         if vol.low_delay {
@@ -512,7 +858,14 @@ impl StudioDecoder {
         gb.skip(4 + 15 + 1 + 15 + 1 + 15 + 1 + 3 + 11 + 1 + 15 + 1);
         let low_delay = gb.get(1) != 0;
         let mpeg_quant = gb.get(1) != 0; // mpeg2_stream
-        self.vol = Some(StudioVol { width, height, rgb, chroma_format, low_delay, mpeg_quant });
+        self.vol = Some(StudioVol {
+            width,
+            height,
+            rgb,
+            chroma_format,
+            low_delay,
+            mpeg_quant,
+        });
         gb.next_start_code();
         self.extension_and_user_data(gb, 2);
         Ok(())
@@ -593,7 +946,11 @@ impl StudioDecoder {
     /// mpeg_get_qscale
     fn read_qscale(&self, gb: &mut Bits<'_>) -> i32 {
         let q = gb.get(5) as usize;
-        if self.q_scale_type { NON_LINEAR_QSCALE[q] } else { (q as i32) << 1 }
+        if self.q_scale_type {
+            NON_LINEAR_QSCALE[q]
+        } else {
+            (q as i32) << 1
+        }
     }
 
     /// decode_slice with ff_mpeg4_decode_studio_slice_header: the
@@ -650,7 +1007,11 @@ impl StudioDecoder {
     }
 
     /// mpeg4_decode_studio_mb
-    fn decode_mb(&mut self, gb: &mut Bits<'_>, vol: &StudioVol) -> Result<MbEnd, StreamDecodeError> {
+    fn decode_mb(
+        &mut self,
+        gb: &mut Bits<'_>,
+        vol: &StudioVol,
+    ) -> Result<MbEnd, StreamDecodeError> {
         self.dpcm_direction = 0;
         if gb.get(1) != 0 {
             // DCT; macroblock_type: a quantiser change when it is 0
@@ -681,15 +1042,32 @@ impl StudioDecoder {
 
     /// mpeg4_decode_studio_block: the dequantised coefficients of block
     /// `n` (0 to 3 luma, then alternating Cb and Cr).
-    fn decode_block(&mut self, gb: &mut Bits<'_>, vol: &StudioVol, n: usize) -> Result<(), StreamDecodeError> {
+    fn decode_block(
+        &mut self,
+        gb: &mut Bits<'_>,
+        vol: &StudioVol,
+        n: usize,
+    ) -> Result<(), StreamDecodeError> {
         let min = -(1 << (BITS + 6));
         let max = (1 << (BITS + 6)) - 1;
         let shift = 3 - self.dct_precision as i32;
-        let scan = if self.alternate_scan { &ALTERNATE_VERTICAL } else { &ZIGZAG };
+        let scan = if self.alternate_scan {
+            &ALTERNATE_VERTICAL
+        } else {
+            &ZIGZAG
+        };
         let (cc, dc_vlc, matrix) = if n < 4 {
             (0, &self.dc_luma, &self.intra_matrix)
         } else {
-            ((n & 1) + 1, if vol.rgb { &self.dc_luma } else { &self.dc_chroma }, &self.chroma_intra_matrix)
+            (
+                (n & 1) + 1,
+                if vol.rgb {
+                    &self.dc_luma
+                } else {
+                    &self.dc_chroma
+                },
+                &self.chroma_intra_matrix,
+            )
         };
         let block = &mut self.block32[n];
         *block = [0; 64];
@@ -707,7 +1085,9 @@ impl StudioDecoder {
         block[0] = if vol.mpeg_quant {
             self.last_dc[cc].wrapping_mul(8 >> self.intra_dc_precision)
         } else {
-            self.last_dc[cc].wrapping_mul(8 >> self.intra_dc_precision).wrapping_mul(8 >> self.dct_precision)
+            self.last_dc[cc]
+                .wrapping_mul(8 >> self.intra_dc_precision)
+                .wrapping_mul(8 >> self.dct_precision)
         };
         block[0] = block[0].clamp(min, max);
         let mut mismatch = 1 ^ block[0];
@@ -758,10 +1138,18 @@ impl StudioDecoder {
                     idx += 1;
                     let len = (BITS + self.dct_precision + 4) as usize;
                     let flc = gb.get(len) as i32;
-                    block[j] = if flc >> (len - 1) != 0 { -((flc ^ ((1 << len) - 1)) + 1) } else { flc };
+                    block[j] = if flc >> (len - 1) != 0 {
+                        -((flc ^ ((1 << len) - 1)) + 1)
+                    } else {
+                        flc
+                    };
                 }
             }
-            block[j] = block[j].wrapping_mul(matrix[j]).wrapping_mul(self.qscale).wrapping_mul(1 << shift) / 16;
+            block[j] = block[j]
+                .wrapping_mul(matrix[j])
+                .wrapping_mul(self.qscale)
+                .wrapping_mul(1 << shift)
+                / 16;
             block[j] = block[j].clamp(min, max);
             mismatch ^= block[j];
         }
@@ -771,7 +1159,12 @@ impl StudioDecoder {
 
     /// mpeg4_decode_dpcm_macroblock: component `n` of a DPCM macroblock,
     /// predicted from its left, top and top-left samples.
-    fn decode_dpcm_macroblock(&mut self, gb: &mut Bits<'_>, vol: &StudioVol, n: usize) -> Result<(), StreamDecodeError> {
+    fn decode_dpcm_macroblock(
+        &mut self,
+        gb: &mut Bits<'_>,
+        vol: &StudioVol,
+        n: usize,
+    ) -> Result<(), StreamDecodeError> {
         let (hsub, vsub) = if n == 0 { (0, 0) } else { vol.chroma_shift() };
         let (height, width) = (16usize >> vsub, 16usize >> hsub);
         let block_mean = gb.get(BITS as usize) as i32;
@@ -808,7 +1201,11 @@ impl StudioDecoder {
                     let suffix = gb.get(rice_parameter as usize) as i32;
                     ((prefix as i32) << rice_parameter) + suffix
                 };
-                residual = if residual & 1 != 0 { (-residual) >> 1 } else { residual >> 1 };
+                residual = if residual & 1 != 0 {
+                    (-residual) >> 1
+                } else {
+                    residual >> 1
+                };
                 if i != 0 {
                     top = i32::from(macroblock[idx - width]);
                 }
@@ -836,13 +1233,36 @@ impl StudioDecoder {
         if self.dpcm_direction == 0 {
             let y0 = (mb_x * 16, mb_y * 16);
             for (n, &(dx, dy)) in [(0, 0), (8, 0), (0, 8), (8, 8)].iter().enumerate() {
-                idct_put(&mut picture.planes[0], picture.strides[0], (y0.0 + dx, y0.1 + dy), &self.block32[n]);
+                idct_put(
+                    &mut picture.planes[0],
+                    picture.strides[0],
+                    (y0.0 + dx, y0.1 + dy),
+                    &self.block32[n],
+                );
             }
             let c0 = ((mb_x * 16) >> hsub, (mb_y * 16) >> vsub);
             // Cb, Cr, Cb, Cr below, then (4:4:4) the right column
-            let places: &[(usize, usize, usize)] = &[(1, 0, 0), (2, 0, 0), (1, 0, 8), (2, 0, 8), (1, 8, 0), (2, 8, 0), (1, 8, 8), (2, 8, 8)];
-            for (k, &(plane, dx, dy)) in places.iter().take(BLOCK_COUNT[vol.chroma_format as usize] - 4).enumerate() {
-                idct_put(&mut picture.planes[plane], picture.strides[plane], (c0.0 + dx, c0.1 + dy), &self.block32[4 + k]);
+            let places: &[(usize, usize, usize)] = &[
+                (1, 0, 0),
+                (2, 0, 0),
+                (1, 0, 8),
+                (2, 0, 8),
+                (1, 8, 0),
+                (2, 8, 0),
+                (1, 8, 8),
+                (2, 8, 8),
+            ];
+            for (k, &(plane, dx, dy)) in places
+                .iter()
+                .take(BLOCK_COUNT[vol.chroma_format as usize] - 4)
+                .enumerate()
+            {
+                idct_put(
+                    &mut picture.planes[plane],
+                    picture.strides[plane],
+                    (c0.0 + dx, c0.1 + dy),
+                    &self.block32[4 + k],
+                );
             }
             return;
         }
@@ -853,7 +1273,11 @@ impl StudioDecoder {
             let stride = picture.strides[i];
             for row in 0..h {
                 for col in 0..w {
-                    let (r, c) = if self.dpcm_direction == 1 { (row, col) } else { (h - 1 - row, w - 1 - col) };
+                    let (r, c) = if self.dpcm_direction == 1 {
+                        (row, col)
+                    } else {
+                        (h - 1 - row, w - 1 - col)
+                    };
                     picture.planes[i][(y0 + r) * stride + x0 + c] = src[row * w + col];
                 }
             }
@@ -883,11 +1307,21 @@ fn pixel_format(vol: &StudioVol) -> PixelFormat {
 fn crop(picture: Picture, vol: &StudioVol, pts: Option<i64>) -> StudioFrame {
     let (hsub, vsub) = vol.chroma_shift();
     let (w, h) = (vol.width as usize, vol.height as usize);
-    let dims = [(w, h), ((w + (1 << hsub) - 1) >> hsub, (h + (1 << vsub) - 1) >> vsub), ((w + (1 << hsub) - 1) >> hsub, (h + (1 << vsub) - 1) >> vsub)];
+    let dims = [
+        (w, h),
+        ((w + (1 << hsub) - 1) >> hsub, (h + (1 << vsub) - 1) >> vsub),
+        ((w + (1 << hsub) - 1) >> hsub, (h + (1 << vsub) - 1) >> vsub),
+    ];
     let planes = std::array::from_fn(|p| {
         let (pw, ph) = dims[p];
         let stride = picture.strides[p];
-        (0..ph).flat_map(|r| picture.planes[p][r * stride..r * stride + pw].iter().copied()).collect()
+        (0..ph)
+            .flat_map(|r| {
+                picture.planes[p][r * stride..r * stride + pw]
+                    .iter()
+                    .copied()
+            })
+            .collect()
     });
     StudioFrame {
         width: vol.width,
@@ -927,13 +1361,27 @@ fn idct_row(row: &mut [i32]) {
     let mut b3 = W7.wrapping_mul(r(1)).wrapping_sub(W5.wrapping_mul(r(3)));
     if row[4] != 0 || row[5] != 0 || row[6] != 0 || row[7] != 0 {
         a0 = a0.wrapping_add(W4.wrapping_mul(r(4)).wrapping_add(W6.wrapping_mul(r(6))));
-        a1 = a1.wrapping_add(0u32.wrapping_sub(W4.wrapping_mul(r(4))).wrapping_sub(W2.wrapping_mul(r(6))));
-        a2 = a2.wrapping_add(0u32.wrapping_sub(W4.wrapping_mul(r(4))).wrapping_add(W2.wrapping_mul(r(6))));
+        a1 = a1.wrapping_add(
+            0u32.wrapping_sub(W4.wrapping_mul(r(4)))
+                .wrapping_sub(W2.wrapping_mul(r(6))),
+        );
+        a2 = a2.wrapping_add(
+            0u32.wrapping_sub(W4.wrapping_mul(r(4)))
+                .wrapping_add(W2.wrapping_mul(r(6))),
+        );
         a3 = a3.wrapping_add(W4.wrapping_mul(r(4)).wrapping_sub(W6.wrapping_mul(r(6))));
-        b0 = b0.wrapping_add(W5.wrapping_mul(r(5))).wrapping_add(W7.wrapping_mul(r(7)));
-        b1 = b1.wrapping_sub(W1.wrapping_mul(r(5))).wrapping_sub(W5.wrapping_mul(r(7)));
-        b2 = b2.wrapping_add(W7.wrapping_mul(r(5))).wrapping_add(W3.wrapping_mul(r(7)));
-        b3 = b3.wrapping_add(W3.wrapping_mul(r(5))).wrapping_sub(W1.wrapping_mul(r(7)));
+        b0 = b0
+            .wrapping_add(W5.wrapping_mul(r(5)))
+            .wrapping_add(W7.wrapping_mul(r(7)));
+        b1 = b1
+            .wrapping_sub(W1.wrapping_mul(r(5)))
+            .wrapping_sub(W5.wrapping_mul(r(7)));
+        b2 = b2
+            .wrapping_add(W7.wrapping_mul(r(5)))
+            .wrapping_add(W3.wrapping_mul(r(7)));
+        b3 = b3
+            .wrapping_add(W3.wrapping_mul(r(5)))
+            .wrapping_sub(W1.wrapping_mul(r(7)));
     }
     let out = |v: u32| (v as i32) >> ROW_SHIFT;
     row[0] = out(a0.wrapping_add(b0));
@@ -948,7 +1396,13 @@ fn idct_row(row: &mut [i32]) {
 
 /// idctSparseColPut for column `x` of `block` into `dest`, clipped to 10
 /// bits.
-fn idct_col_put(block: &[i32; 64], x: usize, dest: &mut [u16], stride: usize, (dx, dy): (usize, usize)) {
+fn idct_col_put(
+    block: &[i32; 64],
+    x: usize,
+    dest: &mut [u16],
+    stride: usize,
+    (dx, dy): (usize, usize),
+) {
     let c = |k: usize| block[8 * k + x] as u32;
     let mut a0 = W4.wrapping_mul(c(0).wrapping_add((1u32 << (COL_SHIFT - 1)) / W4));
     let (mut a1, mut a2, mut a3) = (a0, a0, a0);
@@ -995,7 +1449,8 @@ fn idct_col_put(block: &[i32; 64], x: usize, dest: &mut [u16], stride: usize, (d
         a0.wrapping_sub(b0),
     ];
     for (k, v) in values.into_iter().enumerate() {
-        dest[(dy + k) * stride + dx + x] = ((v as i32) >> COL_SHIFT).clamp(0, (1 << BITS) - 1) as u16;
+        dest[(dy + k) * stride + dx + x] =
+            ((v as i32) >> COL_SHIFT).clamp(0, (1 << BITS) - 1) as u16;
     }
 }
 

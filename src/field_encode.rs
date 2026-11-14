@@ -18,12 +18,12 @@
 //! `MVy = 2 * (MVDy + Py / 2)` (§7.7.2.1), each component under the
 //! §7.6.3 `[low:high]` modulo wrap on its own grid (the vertical one
 //! in field units). A conformant stream keeps every reconstructed
-//! component inside that Table 7-9 range and every differential
-//! representable under the VOP's `fcode`, so the estimator takes the
-//! predictor `(Px, Py)` the differentials will be coded against and
-//! confines its candidates to that codable window (a field vector the
-//! encoder left outside the range would be wrapped by the decoder —
-//! black-box-confirmed on the reference decoder).
+//! component inside that Table 7-9 range — the vertical one in field
+//! units, so a field vector reaches twice the frame-line distance of
+//! a frame vector (`mpeg4-visual-errata.md` erratum E4, pinned by the
+//! `interlaced-field-mv-range` fixture) — and codes the differential
+//! `MV - P` reduced into the same range. The estimator therefore
+//! searches the full field-unit range whatever the predictor is.
 //!
 //! Provenance: §7.7.2.1 (field MV reconstruction,
 //! `field_motion_compensate_one_reference`, the `mc` routine) of
@@ -36,11 +36,12 @@ use crate::bvop_prediction::BVopSampleMode;
 use crate::field_motion::mc;
 use crate::half_sample::ReferenceVop;
 use crate::motion::MotionVector;
-use crate::pvop_encode::{mv_range, SEARCH_RANGE};
+use crate::pvop_encode::{SEARCH_RANGE, mv_range, search_window_pels};
 use crate::quarter_sample::interpolate_block_qpel_field_into;
 
 /// The estimate for one output field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct FieldEstimate {
     /// The field motion vector in frame coordinates (VOL units,
     /// vertical component even).
@@ -145,7 +146,10 @@ fn field_sad(src: &[[i32; 16]; 8], pred: &[[i32; 16]; 8]) -> u32 {
 }
 
 /// Full-pel SAD of a source field against reference field `ref_field`
-/// displaced by `(dx, dy)` **field** pels (§7.6.4 edge clamp).
+/// displaced by `(dx, dy)` **field** pels (§7.6.4 edge clamp). Exact
+/// below `limit`; once a partial sum reaches `limit` the walk may
+/// stop and return it (`u32::MAX` asks for the exact SAD).
+#[allow(clippy::too_many_arguments)]
 fn field_sad_full_pel(
     src: &[[i32; 16]; 8],
     reference: &ReferenceVop<'_>,
@@ -154,9 +158,30 @@ fn field_sad_full_pel(
     mb_y: i32,
     dx: i32,
     dy: i32,
+    limit: u32,
+    narrow: Option<&[[u8; 16]; 8]>,
 ) -> u32 {
     let mut sad = 0u32;
     let y0 = mb_y + i32::from(ref_field);
+    // Interior position (the eight same-field lines span 15 frame
+    // lines): whole reference rows, no §7.6.4 clamp.
+    if reference.contains_rect(mb_x + dx, y0 + 2 * dy, 16, 15) {
+        for (j, row) in src.iter().enumerate() {
+            let run = reference
+                .row_run(mb_x + dx, y0 + 2 * (j as i32 + dy), 16)
+                .expect("row inside the plane");
+            let run: &[u8; 16] = run.try_into().expect("sixteen samples");
+            sad += match narrow {
+                Some(rows) => crate::pvop_encode::row_sad_u8(&rows[j], run),
+                None => crate::pvop_encode::row_sad(row, run),
+            };
+            // A partial sum at the limit cannot beat it.
+            if sad >= limit {
+                return sad;
+            }
+        }
+        return sad;
+    }
     for (j, row) in src.iter().enumerate() {
         let ry = y0 + 2 * (j as i32 + dy);
         for (i, &s) in row.iter().enumerate() {
@@ -180,10 +205,12 @@ fn units_per_pel(mode: BVopSampleMode) -> i32 {
 /// source macroblock `src` against both reference field parities of
 /// `reference`, returning the better parity's estimate.
 ///
-/// `predictor` is the shared §7.7.2.1 `(Px, Py)` the two field
-/// differentials will be coded against; candidates are confined to
-/// the window whose differential is representable under `fcode`
-/// (`MVx - Px` and `MVy / 2 - Py / 2` inside the Table 7-9 range).
+/// Candidates span the whole
+/// Table 7-9 range of `fcode` on the field grid (`MVx` and `MVy / 2`
+/// inside `[low, high]`): the §7.6.3 reduction makes every such
+/// vector codable against any predictor (erratum E4 — the vertical
+/// range is a field-unit range), so the predictor the differentials
+/// are coded against does not narrow the window.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn estimate_field_motion(
     src: &[[i32; 16]; 16],
@@ -191,50 +218,99 @@ pub(crate) fn estimate_field_motion(
     mb_x: i32,
     mb_y: i32,
     field: bool,
-    predictor: MotionVector,
     mode: BVopSampleMode,
     fcode: u8,
 ) -> FieldEstimate {
     let src_field = source_field(src, field);
+    let narrow = crate::pvop_encode::narrow_rows(&src_field);
+    let narrow = narrow.as_ref();
     let unit = units_per_pel(mode);
     let (low, high) = mv_range(fcode);
     // Codable window in field MV units (horizontal in VOL units,
-    // vertical in VOL units of *field* lines): the reconstructed
-    // component must lie inside the Table 7-9 `[low, high]` range on
-    // its own grid (§7.6.3 — the general process, wrap included,
-    // applies to interlaced VOPs, so a component the encoder leaves
-    // outside would be wrapped by the decoder) *and* its differential
-    // must be representable under `fcode`.
-    let px = predictor.x;
-    let py_half = predictor.y / 2;
-    let (x_lo, x_hi) = ((px + low).max(low), (px + high).min(high));
-    let (y_lo, y_hi) = ((py_half + low).max(low), (py_half + high).min(high));
+    // vertical in VOL units of *field* lines): the whole Table 7-9
+    // `[low, high]` range on each component's own grid. §7.6.3 reduces
+    // the reconstructed component — the vertical one in field units,
+    // before the §7.7.2.1 doubling (erratum E4) — so the differential
+    // `MV - P` is coded modulo the range width and every vector of the
+    // range is reachable from every predictor.
     let clamp_field =
-        |fx: i32, fy: i32| -> (i32, i32) { (fx.clamp(x_lo, x_hi), fy.clamp(y_lo, y_hi)) };
+        |fx: i32, fy: i32| -> (i32, i32) { (fx.clamp(low, high), fy.clamp(low, high)) };
+    let codable = |dx: i32, dy: i32| -> bool {
+        let (fx, fy) = (dx * unit, dy * unit);
+        (low..=high).contains(&fx) && (low..=high).contains(&fy)
+    };
+    // Widest full-pel displacement (pels horizontally, field lines
+    // vertically) whose sub-pel neighbours stay inside the range.
+    let window = search_window_pels(fcode, mode);
 
     let mut best: Option<FieldEstimate> = None;
     for ref_field in [false, true] {
         // Full-pel search on the field grid; the zero vector keeps the
         // progressive estimator's small favouring bias.
         let mut best_full = (0i32, 0i32);
-        let mut best_full_sad =
-            field_sad_full_pel(&src_field, reference, ref_field, mb_x, mb_y, 0, 0)
-                .saturating_sub(64);
+        let mut best_full_sad = field_sad_full_pel(
+            &src_field,
+            reference,
+            ref_field,
+            mb_x,
+            mb_y,
+            0,
+            0,
+            u32::MAX,
+            narrow,
+        )
+        .saturating_sub(64);
+        let consider = |dx: i32, dy: i32, best: &mut (i32, i32), best_sad: &mut u32| {
+            if (dx, dy) == (0, 0) || !codable(dx, dy) {
+                return;
+            }
+            let sad = field_sad_full_pel(
+                &src_field, reference, ref_field, mb_x, mb_y, dx, dy, *best_sad, narrow,
+            );
+            if sad < *best_sad {
+                *best_sad = sad;
+                *best = (dx, dy);
+            }
+        };
         for dy in -SEARCH_RANGE..=SEARCH_RANGE {
             for dx in -SEARCH_RANGE..=SEARCH_RANGE {
-                if (dx, dy) == (0, 0) {
-                    continue;
+                consider(dx, dy, &mut best_full, &mut best_full_sad);
+            }
+        }
+        if window > SEARCH_RANGE {
+            // Coarse 4-pel lattice over the rest of the window (the
+            // vertical axis reaches the full field-unit range, i.e.
+            // twice the frame-line reach of a frame vector), clipped
+            // so the field block keeps a sample inside the reference,
+            // then a dense pass around the lattice winner.
+            let (ref_w, ref_h) = (reference.width() as i32, reference.height() as i32);
+            let dx_lo = (-window).max(-mb_x - 15);
+            let dx_hi = window.min(ref_w - 1 - mb_x);
+            let dy_lo = (-window).max((-mb_y - 15) / 2);
+            let dy_hi = window.min((ref_h - 1 - mb_y) / 2);
+            let mut coarse = best_full;
+            let mut coarse_sad = best_full_sad;
+            let mut dy = dy_lo;
+            while dy <= dy_hi {
+                let mut dx = dx_lo;
+                while dx <= dx_hi {
+                    if dx.abs() > SEARCH_RANGE || dy.abs() > SEARCH_RANGE {
+                        consider(dx, dy, &mut coarse, &mut coarse_sad);
+                    }
+                    dx += 4;
                 }
-                // Skip full-pel points whose differential cannot be coded.
-                let (fx, fy) = (dx * unit, dy * unit);
-                if fx < x_lo || fx > x_hi || fy < y_lo || fy > y_hi {
-                    continue;
+                dy += 4;
+            }
+            if coarse != best_full {
+                let centre = coarse;
+                for dy in (centre.1 - 3)..=(centre.1 + 3) {
+                    for dx in (centre.0 - 3)..=(centre.0 + 3) {
+                        if dx.abs() <= window && dy.abs() <= window {
+                            consider(dx, dy, &mut coarse, &mut coarse_sad);
+                        }
+                    }
                 }
-                let sad = field_sad_full_pel(&src_field, reference, ref_field, mb_x, mb_y, dx, dy);
-                if sad < best_full_sad {
-                    best_full_sad = sad;
-                    best_full = (dx, dy);
-                }
+                best_full = coarse;
             }
         }
         // Sub-pel ring refinement on the field grid (half, then quarter
@@ -277,7 +353,7 @@ pub(crate) fn estimate_field_motion(
             sad: best_sad,
         };
         // Ties keep the top reference field (the all-zero default).
-        if best.map_or(true, |b| est.sad < b.sad) {
+        if best.is_none_or(|b| est.sad < b.sad) {
             best = Some(est);
         }
     }
@@ -295,7 +371,7 @@ pub(crate) fn field_mv_differential(mv: MotionVector, predictor: MotionVector) -
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::field_motion::{reconstruct_field_motion_vectors, FieldMotionVectors};
+    use crate::field_motion::{FieldMotionVectors, reconstruct_field_motion_vectors};
     use crate::motion::{FieldMvPair, MotionVectorDelta};
 
     /// A textured 32×32 plane whose two fields carry unrelated
@@ -345,16 +421,7 @@ mod tests {
                 src[y][x] = i32::from(p[(8 + 2 * (y / 2) + 1) * 32 + 8 + x]);
             }
         }
-        let est = estimate_field_motion(
-            &src,
-            &reference,
-            8,
-            8,
-            false,
-            MotionVector { x: 0, y: 0 },
-            BVopSampleMode::HalfPel,
-            1,
-        );
+        let est = estimate_field_motion(&src, &reference, 8, 8, false, BVopSampleMode::HalfPel, 1);
         assert!(est.ref_field, "bottom reference field expected: {est:?}");
         assert_eq!(est.mv, MotionVector { x: 0, y: 0 });
         assert_eq!(est.sad, 0);
@@ -364,26 +431,96 @@ mod tests {
     }
 
     #[test]
-    fn candidates_stay_inside_the_codable_window() {
-        let p = plane();
-        let reference = ReferenceVop::new(&p, 32, 32).unwrap();
-        let src = [[128i32; 16]; 16];
-        // A far predictor forces every candidate to the window edge.
-        let pred = MotionVector { x: 60, y: 60 };
+    fn far_predictor_does_not_narrow_the_window() {
+        // Erratum E4: the vertical range is a field-unit range and the
+        // differential is coded modulo its width, so a vector at the
+        // far side of the range from the predictor stays reachable.
+        // Source = the reference's top field 7 field lines up.
+        let (w, h) = (48usize, 64usize);
+        let mut p = vec![0u8; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                p[y * w + x] = ((x * 29 + (y / 2) * 53 + (x * (y / 2)) % 13 * 17) % 251) as u8;
+            }
+        }
+        let reference = ReferenceVop::new(&p, w, h).unwrap();
+        let (mb_x, mb_y) = (16i32, 32i32);
+        let mut src = [[0i32; 16]; 16];
+        for (y, row) in src.iter_mut().enumerate() {
+            for (x, s) in row.iter_mut().enumerate() {
+                let fy = mb_y as usize + 2 * (y / 2) - 14;
+                *s = i32::from(p[fy * w + mb_x as usize + x]);
+            }
+        }
         let est = estimate_field_motion(
             &src,
             &reference,
-            8,
-            8,
-            true,
-            pred,
+            mb_x,
+            mb_y,
+            false,
             BVopSampleMode::HalfPel,
             1,
         );
+        assert_eq!(est.mv, MotionVector { x: 0, y: -28 });
+        assert!(!est.ref_field);
+        assert_eq!(est.sad, 0);
+        // Against a predictor at the opposite end of the range
+        // (Py / 2 = 31) the differential leaves [low:high]; it is
+        // emitted reduced and the decoder's field-unit reduction
+        // restores the vector.
+        let pred = MotionVector { x: 30, y: 62 };
         let (dx, dy) = field_mv_differential(est.mv, pred);
-        assert!(
-            (-32..=31).contains(&dx) && (-32..=31).contains(&dy),
-            "{est:?}"
+        assert_eq!((dx, dy), (-30, -45));
+        let reduced = crate::vlc_encode::wrap_mvd_component(dy, 1);
+        assert_eq!(reduced, 19);
+        let pair = FieldMvPair {
+            top: MotionVectorDelta { dx, dy: reduced },
+            bottom: MotionVectorDelta { dx, dy: reduced },
+        };
+        let recon =
+            crate::field_motion::reconstruct_field_motion_vectors_wrapped(pair, pred.x, pred.y, 1);
+        assert_eq!(recon.top, est.mv);
+    }
+
+    #[test]
+    fn wide_window_reaches_the_field_unit_range() {
+        // fcode 1, half-sample: the field-unit range [-32, 31] spans
+        // 15 field lines = 30 frame lines, twice the reach of a frame
+        // vector. Source = the top reference field 13 field lines down.
+        let (w, h) = (48usize, 96usize);
+        let mut p = vec![0u8; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                // Smooth, aperiodic texture (the coarse lattice needs
+                // a SAD surface with a basin, as natural content has).
+                let (fx, ff) = (x as f64, (y / 2) as f64);
+                let v = 128.0
+                    + 60.0 * (fx / 9.0).sin() * (ff / 6.3).cos()
+                    + 40.0 * ((fx + 2.0 * ff) / 17.0).sin()
+                    + 0.9 * ff;
+                p[y * w + x] = v.round().clamp(0.0, 255.0) as u8;
+            }
+        }
+        let reference = ReferenceVop::new(&p, w, h).unwrap();
+        let (mb_x, mb_y) = (16i32, 32i32);
+        let mut src = [[0i32; 16]; 16];
+        for (y, row) in src.iter_mut().enumerate() {
+            for (x, s) in row.iter_mut().enumerate() {
+                let fy = mb_y as usize + 2 * (y / 2) + 26;
+                *s = i32::from(p[fy * w + mb_x as usize + x]);
+            }
+        }
+        let est = estimate_field_motion(
+            &src,
+            &reference,
+            mb_x,
+            mb_y,
+            false,
+            BVopSampleMode::HalfPel,
+            1,
         );
+        // 13 field lines = 26 field half-samples = 52 frame units.
+        assert_eq!(est.mv, MotionVector { x: 0, y: 52 });
+        assert_eq!(est.sad, 0);
     }
 }

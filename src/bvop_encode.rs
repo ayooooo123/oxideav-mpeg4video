@@ -51,20 +51,20 @@
 
 use crate::bitreader::BitReader;
 use crate::bitwriter::BitWriter;
-use crate::block::{nonintra_quant_matrix, InterMacroblock};
+use crate::block::{InterMacroblock, nonintra_quant_matrix};
 use crate::bvop::BVopMbType;
 use crate::bvop_mv::{BVopAnchorPlanes, BVopMbDecode};
 use crate::bvop_prediction::{BVopMvPair, BVopPredictionMode, BVopSampleMode, MB_SUB_BLOCKS};
 use crate::framestore::{DecodedFrame, FrameStore};
 use crate::ivop_encode::{EncoderConfig, FrameView};
 use crate::motion::{
-    direct_mode_motion_vector, DirectCoLocatedMv, DirectMvUnits, MotionVector, MotionVectorDelta,
+    DirectCoLocatedMv, DirectMvUnits, MotionVector, MotionVectorDelta, direct_mode_motion_vector,
 };
 use crate::pvop_encode::{estimate_motion, quantise_inter_block, sample_mode_of, source_luma_mb};
 use crate::pvop_mv::PvopMbMotion;
 use crate::texture::{AcEvent, TcoefTable};
 use crate::vlc_encode::{put_ac_events, put_motion_vector};
-use crate::vop::{parse_vop_header_body, vop_time_increment_bits, VopCodingType, VopContext};
+use crate::vop::{VopCodingType, VopContext, parse_vop_header_body, vop_time_increment_bits};
 use crate::vop_decode::decode_b_vop_macroblocks;
 
 const VOP_START_CODE: u32 = 0x0000_01B6;
@@ -120,6 +120,7 @@ pub fn write_b_vop_header(
 
 /// Per-VOP B encode statistics (mode-decision observability).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct BVopEncodeStats {
     /// §6.2.6 zero-bit macroblocks (co-located future-P MB skipped).
     pub zero_bit: usize,
@@ -276,14 +277,23 @@ pub(crate) fn candidate_sad(
     mb_y: i32,
     mode: BVopSampleMode,
 ) -> u32 {
-    let recon = cand
-        .decode
-        .reconstruct(anchors, &InterMacroblock::zero(), mb_x, mb_y, 0, mode, 8);
+    // Only the luminance is scored: form just that prediction (with a
+    // zero residual the §7.3 reconstruction is the prediction itself).
+    let mut pred = [0u8; 256];
+    crate::bvop_prediction::generate_b_vop_luma_prediction_into(
+        anchors.forward_luma,
+        anchors.backward_luma,
+        &cand.decode.mvs,
+        mb_x,
+        mb_y,
+        0,
+        mode,
+        cand.decode.prediction_mode,
+        &mut pred,
+    );
     let mut sad = 0u32;
-    for (j, row) in src.iter().enumerate() {
-        for (i, &s) in row.iter().enumerate() {
-            sad += (s - recon.luma[j][i]).unsigned_abs();
-        }
+    for (row, pred_row) in src.iter().zip(pred.as_chunks::<16>().0) {
+        sad += crate::pvop_encode::row_sad(row, pred_row);
     }
     sad
 }
@@ -677,7 +687,7 @@ mod tests {
     fn mb_type_codes_match_table_b4() {
         // Emit each type and decode through the crate's own Table B.4
         // parser path (modb "01" + mb_type).
-        use crate::bvop::{parse_b_vop_mb_header, BMbTypeTable};
+        use crate::bvop::{BMbTypeTable, parse_b_vop_mb_header};
         use crate::vol::parse_video_object_layer;
         let cfg = EncoderConfig {
             width: 16,

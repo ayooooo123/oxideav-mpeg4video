@@ -42,9 +42,9 @@
 
 use crate::bitreader::BitReader;
 use crate::block::{
-    decode_b_vop_inter_macroblock, decode_inter_macroblock, decode_intra_block_full,
-    intra_quant_matrix, nonintra_quant_matrix, pattern_code, BlockAssemblyError, IntraMacroblock,
-    MacroblockTextureContext,
+    BlockAssemblyError, IntraMacroblock, MacroblockTextureContext, decode_b_vop_inter_macroblock,
+    decode_inter_macroblock, decode_intra_block_full, intra_quant_matrix, nonintra_quant_matrix,
+    pattern_code,
 };
 use crate::bvop_mv::{
     BVopMbTexturedDecode, BVopMvDriver, BVopMvDriverError, BVopTextureParams, CoLocatedAnchor,
@@ -52,15 +52,15 @@ use crate::bvop_mv::{
 use crate::compat::DecodeOptions;
 use crate::data_partition::use_intra_dc_vlc;
 use crate::frame_decode::{PVopMbContent, SGmcMbContent};
-use crate::macroblock::{parse_macroblock_header, MacroblockParseError};
-use crate::motion::{averaged_motion_vector, DirectCoLocatedMv, MotionVector, AMV_PIXEL_COUNT};
+use crate::macroblock::{MacroblockParseError, parse_macroblock_header};
+use crate::motion::{AMV_PIXEL_COUNT, DirectCoLocatedMv, MotionVector, averaged_motion_vector};
 use crate::neighbour::{BlockNeighbour, IntraBlockGrid};
 use crate::pvop_mv::{MvDriver, PvopMbMotion, PvopMvError};
-use crate::reconstruct::{reconstruct_intra_macroblock, ReconstructedMacroblock};
+use crate::reconstruct::{ReconstructedMacroblock, reconstruct_intra_macroblock};
 use crate::sprite::SpriteTrajectory;
 use crate::video_packet::{
-    consume_next_resync_marker, parse_video_packet_header, probe_resync_marker, VideoPacketContext,
-    VideoPacketHeader, VideoPacketParseError,
+    VideoPacketContext, VideoPacketHeader, VideoPacketParseError, consume_next_resync_marker,
+    parse_video_packet_header, probe_resync_marker,
 };
 use crate::vol::{SpriteEnable, SpriteWarpingAccuracy, VolHeader};
 use crate::vop::{VopCodingType, VopHeader};
@@ -68,6 +68,7 @@ use crate::warp::WarpGeometry;
 
 /// Errors raised by the bitstream-driven VOP macroblock walks.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum VopDecodeError {
     /// The VOL / VOP configuration selects a branch this walk does not
     /// decode (data partitioning, interlace, OBMC, quarter-sample, a
@@ -421,6 +422,7 @@ pub fn decode_i_vop_macroblocks(
                 ac_pred_flag: header.ac_pred_flag,
                 alternate_vertical_scan: vop.alternate_vertical_scan,
                 intra_mismatch_exempt: opts.ecosystem_compat,
+                transform: opts.block_transform(),
             };
             let coded = pattern_code(header.cbpy, header.cbpc);
             let mb = decode_intra_mb_with_grid(
@@ -625,6 +627,7 @@ pub fn decode_i_vop_macroblocks_dp(
                 ac_pred_flag: tex.ac_pred_flag,
                 alternate_vertical_scan: vop.alternate_vertical_scan,
                 intra_mismatch_exempt: opts.ecosystem_compat,
+                transform: opts.block_transform(),
             };
             let coded = pattern_code(tex.cbpy, mb.cbpc);
             let imb = decode_intra_mb_partitioned(
@@ -723,7 +726,7 @@ pub fn decode_p_vop_macroblocks_dp(
                     // GMC needs the S(GMC) walk; `is_s_gmc == false`
                     // keeps this arm unreachable on conforming input.
                     DpMbEvent::Gmc => {
-                        return Err(crate::data_partition::DataPartitionError::Truncated)
+                        return Err(crate::data_partition::DataPartitionError::Truncated);
                     }
                 }
                 .map_err(|_| crate::data_partition::DataPartitionError::Truncated)?;
@@ -760,6 +763,7 @@ pub fn decode_p_vop_macroblocks_dp(
                         ac_pred_flag: tex.ac_pred_flag,
                         alternate_vertical_scan: vop.alternate_vertical_scan,
                         intra_mismatch_exempt: opts.ecosystem_compat,
+                        transform: opts.block_transform(),
                     };
                     let imb = decode_intra_mb_partitioned(
                         br,
@@ -783,6 +787,7 @@ pub fn decode_p_vop_macroblocks_dp(
                         ac_pred_flag: false,
                         alternate_vertical_scan: vop.alternate_vertical_scan,
                         intra_mismatch_exempt: opts.ecosystem_compat,
+                        transform: opts.block_transform(),
                     };
                     let residual = decode_inter_mb_partitioned(
                         br,
@@ -995,6 +1000,7 @@ pub fn decode_s_gmc_vop_macroblocks_dp(
                     ac_pred_flag: tex.ac_pred_flag,
                     alternate_vertical_scan: vop.alternate_vertical_scan,
                     intra_mismatch_exempt: opts.ecosystem_compat,
+                    transform: opts.block_transform(),
                 };
                 match motions[k] {
                     SMotion::Intra => {
@@ -1202,6 +1208,7 @@ fn recover_dp_p_packet_texture(
             ac_pred_flag: false,
             alternate_vertical_scan: vop.alternate_vertical_scan,
             intra_mismatch_exempt: opts.ecosystem_compat,
+            transform: opts.block_transform(),
         };
         let residual = stitched[k]
             .as_ref()
@@ -1320,6 +1327,7 @@ pub fn decode_p_vop_macroblocks(
                 ac_pred_flag: header.ac_pred_flag,
                 alternate_vertical_scan: vop.alternate_vertical_scan,
                 intra_mismatch_exempt: opts.ecosystem_compat,
+                transform: opts.block_transform(),
             };
 
             let is_intra = header.mb_type.map(|t| t.is_intra()).unwrap_or(false);
@@ -1381,8 +1389,9 @@ pub fn decode_p_vop_macroblocks(
 /// * a 4-MV inter MB → its four sub-block vectors `{MV[i]}` in
 ///   Figure 6-8 order (§7.6.9.5.2 gives each 8×8 block its own
 ///   scaled `(MVF[i], MVB[i])` pair),
-/// * an intra MB (or a GMC MB, which carries no local vector) → the
-///   §7.6.9.5.1 final-sentence zero-vector fallback.
+/// * an intra MB → the §7.6.9.5.1 final-sentence zero-vector fallback
+///   (a GMC MB reaches this adapter as a 1-MV MB carrying its
+///   §7.8.7.3 averaged motion vector).
 fn co_located_from_motion(motion: PvopMbMotion) -> CoLocatedAnchor {
     match motion {
         PvopMbMotion::Skipped => {
@@ -1444,6 +1453,7 @@ pub fn decode_b_vop_macroblocks(
         max_quantiser_scale: max_qp,
         bits_per_pixel: u32::from(vol.bits_per_pixel),
         quant_type: vol.quant_type,
+        transform: opts.block_transform(),
     };
     // Resync-aware raster loop — the video-packet analogue of
     // `BVopMvDriver::decode_vop`: per §7.6.8 a resync marker resets the
@@ -1526,6 +1536,7 @@ pub fn decode_b_vop_macroblocks(
                 ac_pred_flag: false,
                 alternate_vertical_scan: vop.alternate_vertical_scan,
                 intra_mismatch_exempt: opts.ecosystem_compat,
+                transform: opts.block_transform(),
             };
             let residual = decode_b_vop_inter_macroblock(br, motion.cbpb, ctx, &quant_matrix)
                 .map_err(|e| VopDecodeError::BVop(BVopMvDriverError::Texture(e)))?;
@@ -1723,6 +1734,7 @@ pub fn decode_b_vop_interlaced_macroblocks(
                 ac_pred_flag: false,
                 alternate_vertical_scan: vop.alternate_vertical_scan,
                 intra_mismatch_exempt: opts.ecosystem_compat,
+                transform: opts.block_transform(),
             };
             let mut residual = decode_b_vop_inter_macroblock(br, motion.cbpb(), ctx, &quant_matrix)
                 .map_err(|e| VopDecodeError::BVop(BVopMvDriverError::Texture(e)))?;
@@ -1794,12 +1806,15 @@ pub(crate) fn gmc_averaged_mv(
     let mut amv =
         averaged_motion_vector(&mvs_x, &mvs_y, geometry.s as u32, quarter_sample, vop_fcode)
             .map_err(|e| VopDecodeError::Motion(PvopMvError::Motion(e)))?;
-    if ecosystem_compat {
-        // Compat divergence 3 (`crate::compat`): the deployed ecosystem
+    if ecosystem_compat && geometry.s == 2 && geometry.is_translation() {
+        // Compat divergence 3 (`crate::compat`): for a translational
+        // warp at half-sample sprite accuracy the deployed ecosystem
         // derives each non-positive AMV component one MV-grid unit
         // lower than the §7.8.7.3 quantisation (strictly positive
         // components exact; measured on crafted GMC-neighbour probes at
-        // both half- and quarter-sample, zero included: 0 → −1).
+        // both half- and quarter-sample, zero included: 0 → −1). Finer
+        // accuracies and non-translational warps follow §7.8.7.3
+        // (measured against XviD GMC streams at 1/16 sample).
         // Re-clip to the Table 7-9 range afterwards.
         let f = 1i32 << (vop_fcode - 1);
         let (low, high) = (-32 * f, 32 * f - 1);
@@ -1927,6 +1942,7 @@ pub fn decode_s_gmc_vop_macroblocks(
                 ac_pred_flag: header.ac_pred_flag,
                 alternate_vertical_scan: vop.alternate_vertical_scan,
                 intra_mismatch_exempt: opts.ecosystem_compat,
+                transform: opts.block_transform(),
             };
 
             let is_intra = header.mb_type.map(|t| t.is_intra()).unwrap_or(false);
@@ -2233,10 +2249,10 @@ mod tests {
         let vop = test_i_vop(&vol, 8);
         let mut w = BitWriter::default();
         write_intra_mb_first_block_dc_plus1(&mut w); // 22 bits
-                                                     // §5.2.5 stuffing to the byte boundary: '0' + '1's.
+        // §5.2.5 stuffing to the byte boundary: '0' + '1's.
         w.write_bits(0, 1);
         w.write_bits(1, 1); // now at bit 24
-                            // resync_marker: 16 zeros + 1 (I-VOP → 17 bits).
+        // resync_marker: 16 zeros + 1 (I-VOP → 17 bits).
         w.write_bits(1, 17);
         // macroblock_number: 2 MBs total → 1 bit (Table 6-27).
         w.write_bits(1, 1);
@@ -2302,7 +2318,7 @@ mod tests {
         w.write_bits(0b11, 2); // cbpy inter 0
         w.write_bits(1, 1); // MVDx 0
         w.write_bits(1, 1); // MVDy 0
-                            // Stuffing from bit 6: '0' + '1' → bit 8 (byte aligned).
+        // Stuffing from bit 6: '0' + '1' → bit 8 (byte aligned).
         w.write_bits(0, 1);
         w.write_bits(1, 1);
         // P-VOP resync marker: 15 + fcode(1) zeros + 1 → 17 bits.
@@ -2310,7 +2326,7 @@ mod tests {
         w.write_bits(1, 1); // macroblock_number = 1
         w.write_bits(8, 5); // quant_scale
         w.write_bits(0, 1); // header_extension_code
-                            // MB1: same coded inter MB.
+        // MB1: same coded inter MB.
         w.write_bits(0, 1);
         w.write_bits(0b1, 1);
         w.write_bits(0b11, 2);
@@ -2727,7 +2743,7 @@ mod tests {
     /// backward P (flat 80, intra content).
     fn two_flat_anchor_store() -> FrameStore {
         use crate::reconstruct::{
-            ReconstructedMacroblock, MACROBLOCK_CHROMA_SIDE, MACROBLOCK_LUMA_SIDE,
+            MACROBLOCK_CHROMA_SIDE, MACROBLOCK_LUMA_SIDE, ReconstructedMacroblock,
         };
         let flat = |v: i32| ReconstructedMacroblock {
             luma: [[v; MACROBLOCK_LUMA_SIDE]; MACROBLOCK_LUMA_SIDE],
@@ -2906,5 +2922,34 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    fn geometry(
+        points: [[i32; 2]; 3],
+        accuracy: crate::vol::SpriteWarpingAccuracy,
+    ) -> WarpGeometry {
+        let trajectory = crate::sprite::SpriteTrajectory { count: 3, points };
+        WarpGeometry::decode(&trajectory, 176, 144, accuracy)
+    }
+
+    /// Compat divergence 3 is scoped to translational warps at half-sample sprite accuracy:
+    /// black-box reference decodes of zooms and of translations at finer accuracies average
+    /// exactly as §7.8.7.3 says, non-positive components included.
+    #[test]
+    fn compat_amv_matches_the_spec_for_finer_accuracy_warps() {
+        use crate::vol::SpriteWarpingAccuracy::SixteenthPel;
+        let zoom = geometry([[-9, -7], [18, 0], [0, 15]], SixteenthPel);
+        let pan = geometry([[-20, -10], [0, 0], [0, 0]], SixteenthPel);
+        for (name, geo) in [("zoom", zoom), ("pan", pan)] {
+            for (mb_x, mb_y) in [(0, 0), (16, 0), (0, 16), (32, 32)] {
+                let spec = gmc_averaged_mv(&geo, mb_x, mb_y, false, 1, false).unwrap();
+                let compat = gmc_averaged_mv(&geo, mb_x, mb_y, false, 1, true).unwrap();
+                assert!(
+                    spec.x <= 0 && spec.y <= 0,
+                    "{name} ({mb_x}, {mb_y}): probe is non-positive"
+                );
+                assert_eq!(compat, spec, "{name} ({mb_x}, {mb_y})");
+            }
+        }
     }
 }

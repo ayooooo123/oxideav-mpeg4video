@@ -7,7 +7,7 @@
 use oxideav_mpeg4video::decoder::Mpeg4VideoDecoder;
 use oxideav_mpeg4video::framestore::{DecodedFrame, FrameStore};
 use oxideav_mpeg4video::ivop_encode::{
-    encode_i_vop, write_configuration_headers, EncoderConfig, FrameView,
+    EncoderConfig, FrameView, encode_i_vop, write_configuration_headers,
 };
 use oxideav_mpeg4video::svop_encode::{encode_s_vop, reconstruct_own_s_vop_with_motion};
 use oxideav_mpeg4video::vol::parse_video_object_layer;
@@ -78,13 +78,11 @@ fn assert_exact(frames: &[DecodedFrame], recons: &[DecodedFrame]) {
 #[test]
 fn global_translation_lands_in_the_trajectory() {
     let (w, h) = (96usize, 64usize);
-    let cfg = EncoderConfig {
-        width: w as u16,
-        height: h as u16,
-        gmc: true,
-        fcode: 2,
-        ..EncoderConfig::default()
-    };
+    let cfg = EncoderConfig::default()
+        .with_width(w as u16)
+        .with_height(h as u16)
+        .with_gmc(true)
+        .with_fcode(2);
     let (headers, vol) = vol_of(&cfg);
     assert!(matches!(
         vol.sprite_enable,
@@ -129,12 +127,10 @@ fn global_translation_lands_in_the_trajectory() {
 #[test]
 fn stationary_scene_collapses_to_gmc_copies() {
     let (w, h) = (48usize, 48usize);
-    let cfg = EncoderConfig {
-        width: w as u16,
-        height: h as u16,
-        gmc: true,
-        ..EncoderConfig::default()
-    };
+    let cfg = EncoderConfig::default()
+        .with_width(w as u16)
+        .with_height(h as u16)
+        .with_gmc(true);
     let (headers, vol) = vol_of(&cfg);
     let (y, cb, cr) = picture(w, h, 0, (0, 0));
     let view = FrameView {

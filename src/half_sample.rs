@@ -276,7 +276,13 @@ impl<'a> ReferenceVop<'a> {
     /// the block at the visible edge. Below a macroblock-aligned edge the
     /// plane holds decoded samples, so the clip moves such a block. The
     /// vector is unchanged without a block clip.
-    pub fn block_vector(&self, mv: (i32, i32), origin: (i32, i32), frac_bits: u32, guard: i32) -> (i32, i32) {
+    pub fn block_vector(
+        &self,
+        mv: (i32, i32),
+        origin: (i32, i32),
+        frac_bits: u32,
+        guard: i32,
+    ) -> (i32, i32) {
         let Some((visible_w, visible_h)) = self.block_clip else {
             return mv;
         };
@@ -286,7 +292,10 @@ impl<'a> ReferenceVop<'a> {
             let frac = if src == edge { 0 } else { v & mask };
             ((src - at) << frac_bits) | frac
         };
-        (axis(mv.0, origin.0, visible_w), axis(mv.1, origin.1, visible_h))
+        (
+            axis(mv.0, origin.0, visible_w),
+            axis(mv.1, origin.1, visible_h),
+        )
     }
 
     /// Plane width in samples.
@@ -310,6 +319,28 @@ impl<'a> ReferenceVop<'a> {
         let cy = y.clamp(0, self.height - 1);
         let idx = (cy as usize) * (self.stride as usize) + (cx as usize);
         self.samples[idx]
+    }
+
+    /// The `len` samples of row `y` starting at column `x`, when the
+    /// whole run lies inside the plane (no §7.6.4 clamp involved);
+    /// `None` otherwise.
+    #[inline]
+    pub(crate) fn row_run(&self, x: i32, y: i32, len: usize) -> Option<&'a [u8]> {
+        if x < 0 || y < 0 || y >= self.height || (x as usize) + len > self.width as usize {
+            return None;
+        }
+        let start = (y as usize) * (self.stride as usize) + (x as usize);
+        self.samples.get(start..start + len)
+    }
+
+    /// `true` when the `w × h` rectangle at `(x, y)` lies entirely
+    /// inside the plane.
+    #[inline]
+    pub(crate) fn contains_rect(&self, x: i32, y: i32, w: usize, h: usize) -> bool {
+        x >= 0
+            && y >= 0
+            && (x as usize) + w <= self.width as usize
+            && (y as usize) + h <= self.height as usize
     }
 }
 
@@ -444,7 +475,16 @@ pub fn interpolate_block_into(
         && i64::from(x0) + block_w as i64 + i64::from(half_x) <= i64::from(vop.width)
         && i64::from(y0) + block_h as i64 + i64::from(half_y) <= i64::from(vop.height);
     if inside {
-        interpolate_inside(vop, x0 as usize, y0 as usize, block_w, block_h, (half_x, half_y), rc, out);
+        interpolate_inside(
+            vop,
+            x0 as usize,
+            y0 as usize,
+            block_w,
+            block_h,
+            (half_x, half_y),
+            rc,
+            out,
+        );
         return;
     }
     for j in 0..block_h {
@@ -472,14 +512,29 @@ fn interpolate_inside(
 ) {
     let stride = vop.stride as usize;
     let src = &vop.samples[y0 * stride + x0..];
-    #[cfg(any(target_arch = "aarch64", all(target_arch = "wasm32", target_feature = "simd128")))]
+    #[cfg(any(
+        target_arch = "aarch64",
+        all(target_arch = "wasm32", target_feature = "simd128")
+    ))]
     if block_w == 8 || block_w == 16 {
         let phase = u8::from(half.0) | (u8::from(half.1) << 1);
-        crate::simd::pixels(out, block_w, src, stride, block_w, block_h, phase, 1 - u16::from(rc), false);
+        crate::simd::pixels(
+            out,
+            block_w,
+            src,
+            stride,
+            block_w,
+            block_h,
+            phase,
+            1 - u16::from(rc),
+            false,
+        );
         return;
     }
     let row = |j: usize| &src[j * stride..j * stride + block_w + 1 - usize::from(!half.0)];
-    let rows = out[..block_w * block_h].chunks_exact_mut(block_w).enumerate();
+    let rows = out[..block_w * block_h]
+        .chunks_exact_mut(block_w)
+        .enumerate();
     let round = 1 - u16::from(rc);
     match half {
         (false, false) => {
@@ -505,9 +560,13 @@ fn interpolate_inside(
         (true, true) => {
             for (j, dst) in rows {
                 let (a, c) = (row(j), row(j + 1));
-                let pairs = a[..block_w].iter().zip(&a[1..]).zip(c[..block_w].iter().zip(&c[1..]));
+                let pairs = a[..block_w]
+                    .iter()
+                    .zip(&a[1..])
+                    .zip(c[..block_w].iter().zip(&c[1..]));
                 for (d, ((&p, &q), (&r, &s))) in dst.iter_mut().zip(pairs) {
-                    *d = ((u16::from(p) + u16::from(q) + u16::from(r) + u16::from(s) + round + 1) >> 2) as u8;
+                    *d = ((u16::from(p) + u16::from(q) + u16::from(r) + u16::from(s) + round + 1)
+                        >> 2) as u8;
                 }
             }
         }
@@ -517,6 +576,50 @@ fn interpolate_inside(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interior_fast_path_equals_the_per_sample_equation() {
+        // Every block position (interior and clamped), all four
+        // sub-pel phases, both rounding controls, two block sizes:
+        // the block routine equals the per-sample §7.6.2.1 fetch.
+        let (w, h) = (40usize, 36usize);
+        let mut state = 0x2545_F491u32;
+        let plane: Vec<u8> = (0..w * h)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                (state >> 24) as u8
+            })
+            .collect();
+        let vop = ReferenceVop::new(&plane, w, h).unwrap();
+        for (bw, bh) in [(16usize, 16usize), (8, 8)] {
+            for rc in 0..2u8 {
+                for mv_y in -9..=9 {
+                    for mv_x in -9..=9 {
+                        for (ox, oy) in [(0, 0), (8, 8), (24, 20), (32, 28)] {
+                            let got = interpolate_block(&vop, mv_x, mv_y, ox, oy, bw, bh, rc);
+                            let (xi, hx) = split_half_pel(mv_x);
+                            let (yi, hy) = split_half_pel(mv_y);
+                            for j in 0..bh {
+                                for i in 0..bw {
+                                    let want = fetch_clamped_sample(
+                                        &vop,
+                                        ox + i as i32 + xi,
+                                        oy + j as i32 + yi,
+                                        hx,
+                                        hy,
+                                        rc,
+                                    );
+                                    assert_eq!(got[j * bw + i], want);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn split_half_pel_basic_cases() {

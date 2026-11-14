@@ -11,7 +11,7 @@
 use oxideav_mpeg4video::decoder::Mpeg4VideoDecoder;
 use oxideav_mpeg4video::framestore::{DecodedFrame, FrameStore};
 use oxideav_mpeg4video::ivop_encode::{
-    encode_i_vop, write_configuration_headers, EncoderConfig, FrameView,
+    EncoderConfig, FrameView, encode_i_vop, write_configuration_headers,
 };
 use oxideav_mpeg4video::packet_encode::ResilienceConfig;
 use oxideav_mpeg4video::svop_encode::{encode_s_vop, reconstruct_own_s_vop_with_motion};
@@ -142,21 +142,20 @@ fn diff_against_yuv(
 #[test]
 fn gmc_data_partitioned_round_trips() {
     for (packet_bits, rvlc, points) in [(0u32, false, 1u8), (600, false, 1), (600, true, 3)] {
-        let cfg = EncoderConfig {
-            width: 96,
-            height: 64,
-            gmc: true,
-            gmc_points: points,
-            fcode: 2,
-            adaptive_quant: true,
-            intra_dc_vlc_thr: 3,
-            resilience: ResilienceConfig {
-                packet_bits,
-                data_partitioned: true,
-                reversible_vlc: rvlc,
-            },
-            ..EncoderConfig::default()
-        };
+        let cfg = EncoderConfig::default()
+            .with_width(96)
+            .with_height(64)
+            .with_gmc(true)
+            .with_gmc_points(points)
+            .with_fcode(2)
+            .with_adaptive_quant(true)
+            .with_intra_dc_vlc_thr(3)
+            .with_resilience(
+                ResilienceConfig::default()
+                    .with_packet_bits(packet_bits)
+                    .with_data_partitioned(true)
+                    .with_reversible_vlc(rvlc),
+            );
         let (headers, vol) = vol_of(&cfg);
         assert!(vol.data_partitioned && vol.reversible_vlc == rvlc);
         let mut stream = headers;
@@ -268,21 +267,20 @@ fn truncated_rvlc_texture_on_a_gmc_packet_recovers() {
     use oxideav_mpeg4video::bitreader::BitReader;
     use oxideav_mpeg4video::compat::DecodeOptions;
     use oxideav_mpeg4video::frame_decode::SGmcMbContent;
-    use oxideav_mpeg4video::vop::{parse_vop_header_body, VopContext};
+    use oxideav_mpeg4video::vop::{VopContext, parse_vop_header_body};
     use oxideav_mpeg4video::vop_decode::decode_s_gmc_vop_macroblocks_dp;
 
-    let cfg = EncoderConfig {
-        width: 96,
-        height: 64,
-        gmc: true,
-        fcode: 2,
-        resilience: ResilienceConfig {
-            packet_bits: 0,
-            data_partitioned: true,
-            reversible_vlc: true,
-        },
-        ..EncoderConfig::default()
-    };
+    let cfg = EncoderConfig::default()
+        .with_width(96)
+        .with_height(64)
+        .with_gmc(true)
+        .with_fcode(2)
+        .with_resilience(
+            ResilienceConfig::default()
+                .with_packet_bits(0)
+                .with_data_partitioned(true)
+                .with_reversible_vlc(true),
+        );
     let (_, vol) = vol_of(&cfg);
     let mut store = FrameStore::new();
     let (y, cb, cr) = picture(96, 64, 0, (2, 1));

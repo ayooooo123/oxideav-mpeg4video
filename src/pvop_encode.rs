@@ -38,23 +38,23 @@ use crate::block::nonintra_quant_matrix;
 use crate::bvop_prediction::BVopSampleMode;
 use crate::data_partition::use_intra_dc_vlc;
 use crate::fdct::forward_dct_8x8;
-use crate::field_encode::{estimate_field_motion, field_mv_differential, FieldEstimate};
+use crate::field_encode::{FieldEstimate, estimate_field_motion, field_mv_differential};
 use crate::framestore::{DecodedFrame, FrameStore};
 use crate::ivop_encode::{
-    elect_field_dct, field_dct_luma, forward_scan, intra_mb_fields, plan_block, qfs_to_events,
-    quantise_intra_block, BlockPlan, EncoderConfig, FrameView, PreparedBlock, VopInterlaceFlags,
+    BlockPlan, EncoderConfig, FrameView, PreparedBlock, VopInterlaceFlags, elect_field_dct,
+    field_dct_luma, forward_scan, intra_mb_fields, plan_block, qfs_to_events, quantise_intra_block,
 };
-use crate::motion::{predict_motion_vector, MotionVector};
+use crate::motion::{MotionVector, predict_motion_vector};
 use crate::mv_predictor_grid::MvGrid;
 use crate::neighbour::{BlockNeighbour, IntraBlockGrid};
 use crate::packet_encode::{InterlacedMbInfo, Layout, MbFields, PacketVopInfo, PacketWriter};
 use crate::predictor::select_dc_direction;
-use crate::pvop_mv::{predict_inter_macroblock, PvopMbMotion};
+use crate::pvop_mv::{PvopMbMotion, predict_inter_macroblock};
 use crate::quantise::{quantise_method1_inter, quantise_method2_inter};
 use crate::scan::ScanType;
 use crate::texture::{AcEvent, DcComponent};
-use crate::vop::{parse_vop_header_body, vop_time_increment_bits, VopCodingType, VopContext};
-use crate::vop_decode::{decode_p_vop_macroblocks, AnchorMbMotion};
+use crate::vop::{VopCodingType, VopContext, parse_vop_header_body, vop_time_increment_bits};
+use crate::vop_decode::{AnchorMbMotion, decode_p_vop_macroblocks};
 
 /// Dense full-pel motion search radius in pels (each direction) —
 /// the `fcode == 1` window, whose refined half-pel vector stays inside
@@ -132,6 +132,7 @@ pub fn write_p_vop_header(
 
 /// Per-VOP encode statistics (mode-decision observability for tests).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct PVopEncodeStats {
     /// Macroblocks emitted as `not_coded` skips.
     pub skipped: usize,
@@ -201,6 +202,11 @@ pub(crate) fn source_luma_mb(
 }
 
 /// SAD of the source macroblock against a full-pel reference position.
+/// The sum is exact when it is below `limit`; once a partial sum
+/// reaches `limit` the walk may stop and return that partial sum (a
+/// value `>= limit`), so `result < limit` is always the exact
+/// comparison. Pass `u32::MAX` for the exact SAD.
+#[allow(clippy::too_many_arguments)]
 fn sad_full_pel(
     src: &[[i32; 16]; 16],
     reference: &crate::half_sample::ReferenceVop<'_>,
@@ -208,13 +214,67 @@ fn sad_full_pel(
     mb_y: i32,
     dx: i32,
     dy: i32,
+    limit: u32,
+    narrow: Option<&[[u8; 16]; 16]>,
 ) -> u32 {
     let mut sad = 0u32;
+    // Interior position: whole reference rows, no §7.6.4 clamp.
+    if reference.contains_rect(mb_x + dx, mb_y + dy, 16, 16) {
+        for (j, row) in src.iter().enumerate() {
+            let run = reference
+                .row_run(mb_x + dx, mb_y + dy + j as i32, 16)
+                .expect("row inside the plane");
+            let run: &[u8; 16] = run.try_into().expect("sixteen samples");
+            sad += match narrow {
+                Some(rows) => row_sad_u8(&rows[j], run),
+                None => row_sad(row, run),
+            };
+            // A partial sum that already reaches the limit cannot
+            // beat it: the caller only asks "is it smaller".
+            if sad >= limit {
+                return sad;
+            }
+        }
+        return sad;
+    }
     for (j, row) in src.iter().enumerate() {
         for (i, &s) in row.iter().enumerate() {
             let r = reference.fetch_clamped(mb_x + i as i32 + dx, mb_y + j as i32 + dy);
             sad += (s - i32::from(r)).unsigned_abs();
         }
+    }
+    sad
+}
+
+/// The source rows as 8-bit samples, when every sample is one (a
+/// picture source always is): the byte SAD kernel then applies.
+pub(crate) fn narrow_rows<const R: usize>(src: &[[i32; 16]; R]) -> Option<[[u8; 16]; R]> {
+    let mut out = [[0u8; 16]; R];
+    for (dst, row) in out.iter_mut().zip(src.iter()) {
+        for (d, &s) in dst.iter_mut().zip(row.iter()) {
+            *d = u8::try_from(s).ok()?;
+        }
+    }
+    Some(out)
+}
+
+/// [`row_sad`] over 8-bit source samples.
+#[inline]
+pub(crate) fn row_sad_u8(src: &[u8; 16], reference: &[u8; 16]) -> u32 {
+    let mut sad = 0u32;
+    for i in 0..16 {
+        sad += u32::from(src[i].abs_diff(reference[i]));
+    }
+    sad
+}
+
+/// Sum of absolute differences of one source row against one
+/// reference row.
+#[inline]
+pub(crate) fn row_sad<const N: usize>(src: &[i32; N], reference: &[u8; N]) -> u32 {
+    let mut sad = 0u32;
+    for i in 0..N {
+        sad += (src[i] - i32::from(reference[i])).unsigned_abs();
     }
     sad
 }
@@ -333,12 +393,15 @@ pub(crate) fn estimate_motion(
     fcode: u8,
 ) -> (MotionVector, u32) {
     let mut best = (0i32, 0i32);
-    let mut best_sad = sad_full_pel(src, reference, mb_x, mb_y, 0, 0).saturating_sub(128);
+    let narrow = narrow_rows(src);
+    let narrow = narrow.as_ref();
+    let mut best_sad =
+        sad_full_pel(src, reference, mb_x, mb_y, 0, 0, u32::MAX, narrow).saturating_sub(128);
     let consider = |dx: i32, dy: i32, best: &mut (i32, i32), best_sad: &mut u32| {
         if (dx, dy) == (0, 0) {
             return;
         }
-        let sad = sad_full_pel(src, reference, mb_x, mb_y, dx, dy);
+        let sad = sad_full_pel(src, reference, mb_x, mb_y, dx, dy, *best_sad, narrow);
         if sad < *best_sad {
             *best_sad = sad;
             *best = (dx, dy);
@@ -402,6 +465,19 @@ fn sad_full_pel_block8(
     let (row0, col0) = (8 * (block / 2), 8 * (block % 2));
     let (bx, by) = (mb_x + col0 as i32, mb_y + row0 as i32);
     let mut sad = 0u32;
+    if reference.contains_rect(bx + dx, by + dy, 8, 8) {
+        for j in 0..8 {
+            let run = reference
+                .row_run(bx + dx, by + dy + j as i32, 8)
+                .expect("row inside the plane");
+            let run: &[u8; 8] = run.try_into().expect("eight samples");
+            let row: &[i32; 8] = src[row0 + j][col0..col0 + 8]
+                .try_into()
+                .expect("eight samples");
+            sad += row_sad(row, run);
+        }
+        return sad;
+    }
     for j in 0..8 {
         for i in 0..8 {
             let s = src[row0 + j][col0 + i];
@@ -747,12 +823,8 @@ pub fn encode_p_vop(
                     .field_predictor_candidates(mb_row, mb_col)
                     .expect("grid coordinates in range");
                 let predictor = crate::motion::predict_field_motion_vector(candidates);
-                let top = estimate_field_motion(
-                    &src, &luma_ref, mb_x, mb_y, false, predictor, mode, fcode,
-                );
-                let bottom = estimate_field_motion(
-                    &src, &luma_ref, mb_x, mb_y, true, predictor, mode, fcode,
-                );
+                let top = estimate_field_motion(&src, &luma_ref, mb_x, mb_y, false, mode, fcode);
+                let bottom = estimate_field_motion(&src, &luma_ref, mb_x, mb_y, true, mode, fcode);
                 (top.sad + bottom.sad + FIELD_MODE_BIAS < frame_sad)
                     .then_some((predictor, top, bottom))
             } else {

@@ -55,7 +55,14 @@
 //!    on crafted GMC-neighbour + zero-MVD-local probes at half-sample
 //!    (du −2→−3, −3→−4, −4→−5, −10→−11, 0→−1) and quarter-sample
 //!    (−6→−7, −8→−9, −18→−19, −20→−21); pinned bit-exact by the
-//!    `dec_sgmc_*` fixture pairs (`tests/compat_gmc_amv.rs`).
+//!    `dec_sgmc_*` fixture pairs (`tests/compat_gmc_amv.rs`). Those
+//!    probes are one-point (translational) warps at half-sample sprite
+//!    accuracy, and the adjustment applies only there: XviD GMC streams
+//!    (three warping points at 1/16-sample accuracy, both zooms and
+//!    pure pans) decode like the reference with the §7.8.7.3 value,
+//!    non-positive components included. This matches a rounding right
+//!    shift by the sprite accuracy that biases non-positive values by
+//!    one only when the shift is zero.
 //!
 //! 4. **8×8 block placement** (FFmpeg mpegvideo_motion.c hpel_motion,
 //!    apply_8x8, chroma_4mv_motion; mpeg4video.c ff_mpeg4_set_direct_mv).
@@ -80,6 +87,60 @@
 //!    low-delay stream that ends with a not-coded VOP shows its last
 //!    picture once more.
 //!
+//! Within tolerance, not a divergence: Annex A bounds the IDCT by
+//! accuracy only, so an exact half-integer result may round to either
+//! neighbour. The default rounds it away from zero (§4's convention for
+//! half-integers); ecosystem-compat rounds it to the even neighbour, as
+//! black-box reference decodes do on every DC-only block whose
+//! `F[0][0] / 8` is a half-integer (202.5 → 202, 203.5 → 204). These
+//! halves arise at most quantisers above 4 (`dc_scaler` not 8 or 16),
+//! so on plain ecosystem-encoded streams this choice alone separates
+//! 4–25 % of an I-VOP's samples by one and then drifts through the
+//! prediction chain.
+//!
+//! Not a divergence: §7.6.9.5.1 gives a co-located S(GMC) macroblock
+//! with `mcsel == 1` (coded or skipped) its §7.8.7.3 averaged motion
+//! vector as the direct-mode MV, and both modes do exactly that; the
+//! reference decodes of GMC streams with B-VOPs agree.
+//!
+//! ## Inverse-transform selection
+//!
+//! Also inside the Annex A tolerance: *which* inverse transform. One
+//! widespread encoder family — the one that signs its streams with a
+//! user-data string beginning `XviD` — reconstructs with a specific
+//! integer row–column transform ([`crate::variant_rc`], "variant RC"),
+//! so a decode of those streams with the exact transform is off by a
+//! level here and there and drifts along each chain of predicted
+//! pictures. [`InverseTransformSelection`] chooses between the two:
+//!
+//! * `Simple` — FFmpeg's integer simple IDCT ([`crate::ffmpeg_idct`];
+//!   8 bits per pixel, the exact transform at other depths) for every
+//!   stream. What the literal-spec decode uses unless told otherwise:
+//!   the reference decodes of record are made with it (`ffmpeg -idct
+//!   simple`), and **it never switches on stream content**.
+//! * `Exact` — the Annex A.1 transform for every stream, with the
+//!   mode's half-integer rule (above).
+//! * `FromStream` — what the ecosystem-compat mode selects: the simple
+//!   transform until a user-data unit (`00 00 01 B2`) is seen whose
+//!   payload begins with the four bytes `XviD` immediately followed by
+//!   at least one decimal digit (the digit run, read as an unsigned
+//!   32-bit decimal number, is the encoder's build number); from then
+//!   on variant RC for every texture block — intra and inter, luminance
+//!   and chrominance, I-/P-/B-/S(GMC)-VOPs, combined and
+//!   data-partitioned syntax, progressive and interlaced — for the
+//!   rest of the decoder's life. A later non-matching unit, a new
+//!   configuration header or a seek does not revert it. Short-header
+//!   pictures keep the exact transform.
+//! * `VariantRc` — variant RC for every stream.
+//!
+//! Callers force either transform in either mode through
+//! [`DecodeOptions::with_inverse_transform`] (registry key
+//! `inverse-transform`). The selection changes the transform only:
+//! mismatch control, the intra mismatch exemption and the other compat
+//! behaviours keep their own switches, and the half-integer rule is
+//! simply unused while variant RC is active (integer arithmetic has no
+//! ties).
+//!
 //! Everything else decodes identically in both modes. The switch is
 //! wired through every public decode surface: the
 //! [`crate::vop_decode`] macroblock walks take a [`DecodeOptions`]
@@ -89,11 +150,39 @@
 //! key from [`CodecParameters::options`](oxideav_core::CodecParameters)
 //! (see [`crate::decoder::Mpeg4DecoderOptions`]).
 
+/// Which §7.4.5 inverse transform the decoder reconstructs texture
+/// blocks with (see the module docs, "Inverse-transform selection").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[non_exhaustive]
+pub enum InverseTransformSelection {
+    /// The exact Annex A.1 transform, rounded to nearest, for every
+    /// stream. What a literal-spec decode uses.
+    #[default]
+    Exact,
+    /// The integer row–column transform ([`crate::variant_rc`]) for
+    /// every stream, whatever its user data says.
+    VariantRc,
+    /// Decide from stream evidence: the exact transform until a
+    /// user-data unit carrying the encoder signature with a build
+    /// number has been seen
+    /// ([`crate::decoder::Mpeg4VideoDecoder::detected_encoder_build`]),
+    /// the integer row–column transform from then on for the rest of
+    /// the decoder's life. Under ecosystem-compat "the exact transform"
+    /// here is [`InverseTransformSelection::Simple`], as FFmpeg decodes.
+    FromStream,
+    /// FFmpeg's integer simple IDCT at 8 bits per pixel
+    /// ([`crate::idct::BlockTransform::Simple`]) for every stream,
+    /// whatever its user data says. What an unset selection resolves
+    /// to.
+    Simple,
+}
+
 /// Options selecting the decoder's behaviour on the spec-vs-ecosystem
 /// divergences documented at [`crate::compat`] (module docs).
 ///
 /// `Default` is the literal-spec behaviour on every axis.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct DecodeOptions {
     /// Opt-in ecosystem-compat mode. When `true` the decoder
     /// reproduces the observed ecosystem (FFmpeg) behaviour on exactly
@@ -105,16 +194,52 @@ pub struct DecodeOptions {
     ///   reference fields keep the co-located selections);
     /// * the §7.4.4.5 method-1 mismatch toggle is skipped on intra
     ///   blocks (non-intra blocks keep it);
-    /// * each non-positive §7.8.7.3 GMC averaged-MV component is
-    ///   derived one MV-grid unit lower than the spec quantisation
-    ///   (zero included: 0 → −1);
+    /// * for a translational warp at half-sample sprite accuracy, each
+    ///   non-positive §7.8.7.3 GMC averaged-MV component is derived one
+    ///   MV-grid unit lower than the spec quantisation (zero included:
+    ///   0 → −1);
     /// * 8×8 prediction blocks are placed within the visible area;
     /// * not-coded VOPs, and B-VOPs FFmpeg cannot place, give no
     ///   picture.
     ///
+    /// It also resolves exact half-integer IDCT results to the even
+    /// neighbour ([`crate::idct::HalfIntegerRounding::ToEven`]), a
+    /// choice inside the Annex A accuracy tolerance rather than a
+    /// divergence from the text, and — unless
+    /// [`DecodeOptions::inverse_transform`] says otherwise — selects
+    /// the inverse transform from stream evidence
+    /// ([`InverseTransformSelection::FromStream`]).
+    ///
     /// When `false` (the default) all of these follow the printed
-    /// specification text.
+    /// specification text and one inverse transform is used for every
+    /// stream.
     pub ecosystem_compat: bool,
+    /// Explicit inverse-transform selection. `None` (the default)
+    /// follows the mode: [`InverseTransformSelection::Simple`] for the
+    /// literal-spec decode, [`InverseTransformSelection::FromStream`]
+    /// under `ecosystem_compat`. `Some(_)` forces that selection in
+    /// either mode. See
+    /// [`DecodeOptions::inverse_transform_selection`].
+    pub inverse_transform: Option<InverseTransformSelection>,
+}
+
+impl DecodeOptions {
+    /// Set `ecosystem_compat`.
+    pub fn with_ecosystem_compat(mut self, v: bool) -> Self {
+        self.ecosystem_compat = v;
+        self
+    }
+
+    /// Set `inverse_transform`: an [`InverseTransformSelection`] (or
+    /// `Some(_)`) forces that selection, `None` returns to the mode's
+    /// own choice.
+    pub fn with_inverse_transform(
+        mut self,
+        selection: impl Into<Option<InverseTransformSelection>>,
+    ) -> Self {
+        self.inverse_transform = selection.into();
+        self
+    }
 }
 
 impl DecodeOptions {
@@ -122,6 +247,7 @@ impl DecodeOptions {
     pub const fn spec() -> Self {
         Self {
             ecosystem_compat: false,
+            inverse_transform: None,
         }
     }
 
@@ -129,6 +255,46 @@ impl DecodeOptions {
     pub const fn ecosystem() -> Self {
         Self {
             ecosystem_compat: true,
+            inverse_transform: None,
+        }
+    }
+
+    /// How the IDCT resolves exact half-integers under these options.
+    pub const fn idct_rounding(self) -> crate::idct::HalfIntegerRounding {
+        if self.ecosystem_compat {
+            crate::idct::HalfIntegerRounding::ToEven
+        } else {
+            crate::idct::HalfIntegerRounding::AwayFromZero
+        }
+    }
+
+    /// The inverse-transform selection in effect: the explicit
+    /// [`DecodeOptions::inverse_transform`] when one is set, otherwise
+    /// the mode's own — `Simple` for the literal-spec decode,
+    /// `FromStream` under `ecosystem_compat`.
+    pub const fn inverse_transform_selection(self) -> InverseTransformSelection {
+        match self.inverse_transform {
+            Some(selection) => selection,
+            None if self.ecosystem_compat => InverseTransformSelection::FromStream,
+            None => InverseTransformSelection::Simple,
+        }
+    }
+
+    /// The transform a macroblock walk run with these options applies
+    /// to every block. `FromStream` cannot be decided at this level —
+    /// the evidence lives in the stream decoder, which resolves it to
+    /// `Simple` or `VariantRc` before each VOP — so here it reads as
+    /// the simple transform.
+    #[doc(hidden)]
+    pub const fn block_transform(self) -> crate::idct::BlockTransform {
+        match self.inverse_transform_selection() {
+            InverseTransformSelection::VariantRc => crate::idct::BlockTransform::VariantRc,
+            InverseTransformSelection::Exact => {
+                crate::idct::BlockTransform::Exact(self.idct_rounding())
+            }
+            InverseTransformSelection::Simple | InverseTransformSelection::FromStream => {
+                crate::idct::BlockTransform::Simple
+            }
         }
     }
 }
@@ -147,5 +313,61 @@ mod tests {
     fn ecosystem_constructor_sets_the_switch() {
         assert!(DecodeOptions::ecosystem().ecosystem_compat);
         assert_ne!(DecodeOptions::ecosystem(), DecodeOptions::spec());
+    }
+
+    #[test]
+    fn inverse_transform_follows_the_mode_unless_forced() {
+        use crate::idct::{BlockTransform, HalfIntegerRounding};
+        // Literal spec: the simple transform, never from the stream.
+        let spec = DecodeOptions::spec();
+        assert_eq!(spec.inverse_transform, None);
+        assert_eq!(
+            spec.inverse_transform_selection(),
+            InverseTransformSelection::Simple
+        );
+        assert_eq!(spec.block_transform(), BlockTransform::Simple);
+        // Ecosystem-compat: from stream evidence; without evidence the
+        // walks see the simple transform.
+        let eco = DecodeOptions::ecosystem();
+        assert_eq!(
+            eco.inverse_transform_selection(),
+            InverseTransformSelection::FromStream
+        );
+        assert_eq!(eco.block_transform(), BlockTransform::Simple);
+        assert_eq!(
+            eco.with_inverse_transform(InverseTransformSelection::Exact)
+                .block_transform(),
+            BlockTransform::Exact(HalfIntegerRounding::ToEven)
+        );
+        assert_eq!(
+            spec.with_inverse_transform(InverseTransformSelection::Exact)
+                .block_transform(),
+            BlockTransform::SPEC
+        );
+        assert_eq!(
+            DecodeOptions::default()
+                .with_ecosystem_compat(true)
+                .inverse_transform_selection(),
+            InverseTransformSelection::FromStream
+        );
+        // Forced either way in either mode.
+        for base in [spec, eco] {
+            let forced = base.with_inverse_transform(InverseTransformSelection::VariantRc);
+            assert_eq!(forced.block_transform(), BlockTransform::VariantRc);
+            assert_eq!(forced.ecosystem_compat, base.ecosystem_compat);
+            let exact = base.with_inverse_transform(InverseTransformSelection::Exact);
+            assert_eq!(
+                exact.block_transform(),
+                BlockTransform::Exact(base.idct_rounding())
+            );
+            let simple = base.with_inverse_transform(InverseTransformSelection::Simple);
+            assert_eq!(simple.block_transform(), BlockTransform::Simple);
+            assert_eq!(forced.with_inverse_transform(None), base);
+        }
+        assert_eq!(
+            spec.with_inverse_transform(InverseTransformSelection::FromStream)
+                .inverse_transform_selection(),
+            InverseTransformSelection::FromStream
+        );
     }
 }

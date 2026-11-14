@@ -35,8 +35,8 @@
 //! S(GMC)-VOPs are reordered exactly as P-VOPs (§6.1.3.8 final sentence).
 
 use crate::frame_decode::{
-    assemble_b_vop_frame, assemble_p_vop_frame, assemble_s_gmc_vop_frame, FrameDecodeError,
-    PVopMbContent, SGmcMbContent,
+    FrameDecodeError, PVopMbContent, SGmcMbContent, assemble_b_vop_frame, assemble_p_vop_frame,
+    assemble_s_gmc_vop_frame,
 };
 use crate::framestore::{DecodedFrame, FrameStore};
 use crate::reconstruct::ReconstructedMacroblock;
@@ -59,12 +59,31 @@ pub struct SequenceDecoder {
     /// next places 8×8 blocks as FFmpeg does
     /// ([`DecodedFrame::set_block_clip`]); `None` for the spec placement.
     block_clip: Option<(u32, u32)>,
+    /// Output every VOP as it is decoded (coding order), leaving the
+    /// §6.1.3.8 reorder to the caller (a container's presentation
+    /// times).
+    coded_order: bool,
 }
 
 impl SequenceDecoder {
     /// A fresh decoder with an empty chain and no pending anchor.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Output each VOP's frame as soon as it is decoded, in coding
+    /// order, instead of holding anchors back for the §6.1.3.8 display
+    /// reorder. A held anchor is released by the next call to
+    /// [`SequenceDecoder::flush`].
+    pub fn set_coded_order(&mut self, coded_order: bool) {
+        self.coded_order = coded_order;
+    }
+
+    /// Whether frames are output in coding order
+    /// ([`SequenceDecoder::set_coded_order`]).
+    #[inline]
+    pub fn coded_order(&self) -> bool {
+        self.coded_order
     }
 
     /// Borrow the underlying reference-frame chain (e.g. to inspect the
@@ -104,6 +123,14 @@ impl SequenceDecoder {
             frame.blit_macroblock(idx % mb_width, idx / mb_width, mb)?;
         }
         Ok(self.accept_anchor(frame))
+    }
+
+    /// Accept an already-reconstructed anchor-class VOP (a §7.8
+    /// static-sprite S-VOP) in coding order: releases the held anchor
+    /// for display and holds this one back.
+    #[doc(hidden)]
+    pub fn push_reconstructed_anchor(&mut self, frame: DecodedFrame) -> Vec<DecodedFrame> {
+        self.accept_anchor(frame)
     }
 
     /// Decode a P-VOP in coding order against the current forward anchor.
@@ -269,6 +296,9 @@ impl SequenceDecoder {
         // Push into the reference chain so subsequent VOPs can reference
         // it (this is decode-order state, independent of display delay).
         self.store.push_anchor(frame.clone());
+        if self.coded_order {
+            return vec![frame];
+        }
         // The previously-held anchor is now displayable.
         let mut out = Vec::new();
         if let Some(prev) = self.pending_anchor.take() {

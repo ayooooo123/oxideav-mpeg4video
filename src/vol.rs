@@ -67,6 +67,7 @@ pub const VIDEO_OBJECT_START_CODE_MAX: u32 = 0x0000_011F;
 
 /// Errors produced by the structural VOL header parser.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum VolParseError {
     /// The supplied byte slice ran out mid-field.
     Truncated,
@@ -244,6 +245,16 @@ impl SpriteWarpingAccuracy {
             0b10 => SpriteWarpingAccuracy::EighthPel,
             0b11 => SpriteWarpingAccuracy::SixteenthPel,
             _ => unreachable!("masked to 2 bits"),
+        }
+    }
+
+    /// The Table 6-21 two-bit code of this accuracy.
+    pub(crate) const fn to_bits(self) -> u32 {
+        match self {
+            SpriteWarpingAccuracy::HalfPel => 0b00,
+            SpriteWarpingAccuracy::QuarterPel => 0b01,
+            SpriteWarpingAccuracy::EighthPel => 0b10,
+            SpriteWarpingAccuracy::SixteenthPel => 0b11,
         }
     }
 
@@ -434,6 +445,7 @@ pub struct VbvParameters {
 /// Typed view of the bits that precede VOP data in a Video Object
 /// Layer header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct VolHeader {
     /// The 8-bit `profile_and_level_indication` from the parent
     /// `VisualObjectSequence`.
@@ -1141,7 +1153,7 @@ mod tests {
             assert!(n <= 32);
             for i in (0..n).rev() {
                 let bit = ((value >> i) & 1) as u8;
-                if self.bit_pos % 8 == 0 {
+                if self.bit_pos.is_multiple_of(8) {
                     self.buf.push(0);
                 }
                 let byte = self.buf.last_mut().unwrap();
@@ -1153,7 +1165,7 @@ mod tests {
             self.write_bits(1, 1);
         }
         fn align(&mut self) {
-            while self.bit_pos % 8 != 0 {
+            while !self.bit_pos.is_multiple_of(8) {
                 self.write_bits(0, 1);
             }
         }
@@ -1170,15 +1182,15 @@ mod tests {
     fn write_minimal_trailing(w: &mut BitWriter) {
         w.write_bits(0, 1); // interlaced = 0
         w.write_bits(0, 1); // obmc_disable = 0
-                            // verid == 1 → sprite_enable is 1 bit.
+        // verid == 1 → sprite_enable is 1 bit.
         w.write_bits(0, 1); // sprite_enable = NotUsed
         w.write_bits(0, 1); // not_8_bit = 0
         w.write_bits(0, 1); // quant_type = 0
-                            // verid == 1 → no quarter_sample bit.
+        // verid == 1 → no quarter_sample bit.
         w.write_bits(1, 1); // complexity_estimation_disable = 1
         w.write_bits(1, 1); // resync_marker_disable = 1
         w.write_bits(0, 1); // data_partitioned = 0
-                            // verid == 1 → no newpred / reduced_res bits.
+        // verid == 1 → no newpred / reduced_res bits.
         w.write_bits(0, 1); // scalability = 0
     }
 
@@ -1196,8 +1208,8 @@ mod tests {
         w.write_bits(30_000, 16); // vop_time_increment_resolution
         w.write_marker();
         w.write_bits(1, 1); // fixed_vop_rate = 1
-                            // fixed_vop_time_increment width = bits needed for 0..29999
-                            // ceil(log2(30000)) = 15.
+        // fixed_vop_time_increment width = bits needed for 0..29999
+        // ceil(log2(30000)) = 15.
         let bits = vop_time_increment_bits(30_000) as usize;
         w.write_bits(1001, bits);
         w.write_marker();
@@ -1651,7 +1663,7 @@ mod tests {
         w.write_bits(2, 6); // no_of_sprite_warping_points = 2 (affine)
         w.write_bits(0b01, 2); // sprite_warping_accuracy = 1/4 pel
         w.write_bits(0, 1); // sprite_brightness_change = 0 (mandatory)
-                            // verid != 1 ⇒ sadct_disable only when shape != rect; skipped.
+        // verid != 1 ⇒ sadct_disable only when shape != rect; skipped.
         w.write_bits(0, 1); // not_8_bit
         w.write_bits(0, 1); // quant_type
         w.write_bits(0, 1); // quarter_sample (verid != 1)
@@ -1778,7 +1790,7 @@ mod tests {
         w.write_bits(1, 1); // low_latency_sprite_enable = 1
         w.write_bits(0, 1); // not_8_bit
         w.write_bits(0, 1); // quant_type
-                            // verid == 1 ⇒ no quarter_sample / newpred fields.
+        // verid == 1 ⇒ no quarter_sample / newpred fields.
         w.write_bits(1, 1); // complexity_estimation_disable
         w.write_bits(0, 1); // resync_marker_disable
         w.write_bits(0, 1); // data_partitioned

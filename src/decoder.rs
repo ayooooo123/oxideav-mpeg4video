@@ -41,32 +41,61 @@
 use crate::bitreader::BitReader;
 use crate::block::InterMacroblock;
 use crate::bvop_prediction::BVopSampleMode;
-use crate::compat::DecodeOptions;
+use crate::compat::{DecodeOptions, InverseTransformSelection};
 use crate::frame_decode::{FrameDecodeError, PVopMbContent, SGmcMbContent};
 use crate::framestore::DecodedFrame;
 use crate::pvop_mv::PvopMbMotion;
 use crate::sequence::SequenceDecoder;
 use crate::vol::{
-    parse_video_object_layer, parse_visual_object_header, parse_visual_object_sequence_header,
-    VolHeader, VolParseError, VIDEO_OBJECT_LAYER_START_CODE_MAX, VIDEO_OBJECT_LAYER_START_CODE_MIN,
+    SpriteEnable, VIDEO_OBJECT_LAYER_START_CODE_MAX, VIDEO_OBJECT_LAYER_START_CODE_MIN,
     VIDEO_OBJECT_START_CODE_MAX, VIDEO_OBJECT_START_CODE_MIN, VISUAL_OBJECT_SEQUENCE_END_CODE,
-    VISUAL_OBJECT_SEQUENCE_START_CODE, VISUAL_OBJECT_START_CODE,
+    VISUAL_OBJECT_SEQUENCE_START_CODE, VISUAL_OBJECT_START_CODE, VolHeader, VolParseError,
+    parse_video_object_layer, parse_visual_object_header, parse_visual_object_sequence_header,
 };
 use crate::vop::{
-    parse_group_of_vop_header, parse_vop_header_body_tracking, VopCodingType, VopContext, VopHeader,
-    VopParseError, GROUP_OF_VOP_START_CODE, VOP_START_CODE,
+    GROUP_OF_VOP_START_CODE, VOP_START_CODE, VopCodingType, VopContext, VopHeader, VopParseError,
+    parse_group_of_vop_header, parse_vop_header_body_tracking,
 };
 use crate::vop_decode::{
-    decode_b_vop_interlaced_macroblocks, decode_b_vop_macroblocks, decode_i_vop_macroblocks,
-    decode_p_vop_macroblocks, decode_s_gmc_vop_macroblocks, vop_mb_dimensions, AnchorMbMotion,
-    VopDecodeError,
+    AnchorMbMotion, VopDecodeError, decode_b_vop_interlaced_macroblocks, decode_b_vop_macroblocks,
+    decode_i_vop_macroblocks, decode_p_vop_macroblocks, decode_s_gmc_vop_macroblocks,
+    vop_mb_dimensions,
 };
 
 /// §6.2.1 `user_data_start_code`.
 const USER_DATA_START_CODE: u32 = 0x0000_01B2;
 
+/// The four bytes a user-data payload must begin with for the
+/// inverse-transform stream evidence (see [`encoder_build_of`]).
+const ENCODER_SIGNATURE: &[u8; 4] = b"XviD";
+
+/// The inverse-transform stream evidence of one user-data payload (the
+/// bytes after the four start-code bytes): `Some(build)` when the
+/// payload begins with the signature bytes immediately followed by at
+/// least one ASCII decimal digit — `build` being the maximal digit
+/// run read as an unsigned decimal number — and `None` otherwise.
+///
+/// The match is anchored at payload offset 0 and case-sensitive; a
+/// digit run that does not fit 32 bits is no match; bytes after the
+/// digit run are ignored.
+///
+/// The payload is one §6.2.2.1 `user_data()`: its bytes run to the
+/// next start-code prefix, so a signature split over two units (or
+/// over two calls of the decoder) is never assembled.
+fn encoder_build_of(payload: &[u8]) -> Option<u32> {
+    let rest = payload.strip_prefix(ENCODER_SIGNATURE)?;
+    let digits = rest.iter().take_while(|b| b.is_ascii_digit()).count();
+    if digits == 0 {
+        return None;
+    }
+    rest[..digits].iter().try_fold(0u32, |build, &digit| {
+        build.checked_mul(10)?.checked_add(u32::from(digit - b'0'))
+    })
+}
+
 /// Errors raised by the elementary-stream decoder.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum StreamDecodeError {
     /// A configuration header failed to parse.
     Vol(VolParseError),
@@ -191,6 +220,13 @@ pub struct Mpeg4VideoDecoder {
     /// running 30000/1001 Hz tick clock and the previous
     /// `temporal_reference` (modulo-256 arithmetic, §6.3.5.2).
     short_header: Option<ShortHeaderClock>,
+    /// §7.8.2 sprite memory of a basic static-sprite VOL: the
+    /// reconstructed initial I-VOP (never displayed).
+    sprite: Option<crate::static_sprite::SpritePlanes>,
+    /// The build number of the most recent user-data unit carrying the
+    /// encoder signature ([`encoder_build_of`]). Once set it is never
+    /// cleared.
+    encoder_build: Option<u32>,
     /// The `vop_time_increment` width, set by each VOL and re-derived
     /// by a VOP whose header does not fit it (see
     /// [`parse_vop_header_body_tracking`]).
@@ -268,9 +304,9 @@ fn scan_int(s: &[u8]) -> Option<(i32, &[u8])> {
     if digits == 0 {
         return None;
     }
-    let value = s[..digits]
-        .iter()
-        .fold(0i64, |v, &d| (v * 10 + i64::from(d - b'0')).min(i64::from(u32::MAX)));
+    let value = s[..digits].iter().fold(0i64, |v, &d| {
+        (v * 10 + i64::from(d - b'0')).min(i64::from(u32::MAX))
+    });
     let value = if negative { -value } else { value } as i32;
     Some((value, &s[digits..]))
 }
@@ -296,10 +332,10 @@ fn scan_lavc(text: &[u8]) -> Option<i32> {
     // "FFmpe%*[^b]b%d": at least one byte other than 'b' before the 'b'.
     if let Some(rest) = text.strip_prefix(b"FFmpe") {
         let skipped = rest.iter().take_while(|&&c| c != b'b').count();
-        if skipped > 0 {
-            if let Some((build, _)) = rest.get(skipped + 1..).and_then(scan_int) {
-                return Some(build);
-            }
+        if skipped > 0
+            && let Some((build, _)) = rest.get(skipped + 1..).and_then(scan_int)
+        {
+            return Some(build);
         }
     }
     // "FFmpeg v%d.%d.%d / libavcodec build: %d": a space in the format
@@ -308,7 +344,10 @@ fn scan_lavc(text: &[u8]) -> Option<i32> {
         let mut at = 0;
         for &c in lit {
             if c == b' ' {
-                at += s[at..].iter().take_while(|c| c.is_ascii_whitespace()).count();
+                at += s[at..]
+                    .iter()
+                    .take_while(|c| c.is_ascii_whitespace())
+                    .count();
             } else if s.get(at) == Some(&c) {
                 at += 1;
             } else {
@@ -376,6 +415,69 @@ impl Mpeg4VideoDecoder {
         self.options
     }
 
+    /// The encoder build number found in the stream's user data, if
+    /// any: a user-data unit (`00 00 01 B2`) whose payload begins with
+    /// the bytes `XviD` immediately followed by decimal digits has been
+    /// decoded, and this is its digit run as a number (the most recent
+    /// one when several units matched). Units are examined wherever
+    /// they appear in the data handed to [`Mpeg4VideoDecoder::decode`],
+    /// configuration data included, and in every mode — this accessor
+    /// reports the evidence even when the options do not act on it.
+    ///
+    /// Under [`InverseTransformSelection::FromStream`] (what the
+    /// ecosystem-compat mode selects) a detected build switches the
+    /// decoder to the integer row–column inverse transform for every
+    /// texture block decoded afterwards; the value itself does not
+    /// influence the transform. It is never cleared.
+    pub fn detected_encoder_build(&self) -> Option<u32> {
+        self.encoder_build
+    }
+
+    /// The inverse transform the next VOP's texture blocks will be
+    /// reconstructed with: [`InverseTransformSelection::Simple`],
+    /// [`InverseTransformSelection::Exact`] or
+    /// [`InverseTransformSelection::VariantRc`] — the options'
+    /// selection with `FromStream` resolved against
+    /// [`Mpeg4VideoDecoder::detected_encoder_build`]. (Short-header
+    /// pictures always use the exact transform.)
+    pub fn active_inverse_transform(&self) -> InverseTransformSelection {
+        match self.options.inverse_transform_selection() {
+            InverseTransformSelection::VariantRc => InverseTransformSelection::VariantRc,
+            InverseTransformSelection::FromStream if self.encoder_build.is_some() => {
+                InverseTransformSelection::VariantRc
+            }
+            InverseTransformSelection::Exact => InverseTransformSelection::Exact,
+            _ => InverseTransformSelection::Simple,
+        }
+    }
+
+    /// The options one VOP's macroblock walk runs with: the decoder's
+    /// own, with the inverse-transform selection resolved to the
+    /// transform currently in effect.
+    fn vop_options(&self) -> DecodeOptions {
+        self.options
+            .with_inverse_transform(self.active_inverse_transform())
+    }
+
+    /// Carry stream evidence over from a previous decoder instance of
+    /// the same stream (a seek rebuilds the decoder; the selection
+    /// lasts for the stream).
+    fn inherit_stream_evidence(&mut self, previous: &Self) {
+        self.encoder_build = previous.encoder_build;
+    }
+
+    /// Return each VOP's frame from the call that decodes it, in coding
+    /// order, rather than in §6.1.3.8 display order (for a container
+    /// whose presentation times order the frames). Each frame carries
+    /// the container pts of the call that decoded it and its §6.3.5
+    /// tick time; [`Mpeg4VideoDecoder::flush`] then returns nothing.
+    /// Default `false` (display order). Select it before the first
+    /// VOP: an anchor already held for display when it is switched on
+    /// is released only by the next flush.
+    pub fn set_coded_order_output(&mut self, coded_order: bool) {
+        self.sequence.set_coded_order(coded_order);
+    }
+
     /// The active VOL header, once one has been decoded.
     pub fn vol(&self) -> Option<&VolHeader> {
         self.vol.as_ref()
@@ -423,10 +525,10 @@ impl Mpeg4VideoDecoder {
             let first_sh = crate::short_header::scan_short_header_pictures(data)
                 .first()
                 .copied();
-            if let Some(sh) = first_sh {
-                if first_sc.map_or(true, |sc| sh < sc) {
-                    self.short_header = Some(ShortHeaderClock::default());
-                }
+            if let Some(sh) = first_sh
+                && first_sc.is_none_or(|sc| sh < sc)
+            {
+                self.short_header = Some(ShortHeaderClock::default());
             }
         }
         if self.short_header.is_some() {
@@ -461,8 +563,12 @@ impl Mpeg4VideoDecoder {
         self.skipped_last_frame = false;
         let starts = scan_start_codes(data);
         if self.short_header.is_some() || self.vol.is_none() {
-            let sh = crate::short_header::scan_short_header_pictures(data).first().copied();
-            if self.short_header.is_some() || sh.is_some_and(|sh| starts.first().map_or(true, |&sc| sh < sc)) {
+            let sh = crate::short_header::scan_short_header_pictures(data)
+                .first()
+                .copied();
+            if self.short_header.is_some()
+                || sh.is_some_and(|sh| starts.first().is_none_or(|&sc| sh < sc))
+            {
                 return Ok((self.decode_with_pts(data, container_pts)?, None));
             }
         }
@@ -496,7 +602,9 @@ impl Mpeg4VideoDecoder {
     /// what the headers set (the VOL, the encoder, the time increment
     /// width), as FFmpeg's flush does: the decoder state for a seek.
     pub fn reset_pictures(&mut self) {
+        let coded_order = self.sequence.coded_order();
         self.sequence = SequenceDecoder::new();
+        self.sequence.set_coded_order(coded_order);
         self.anchor_motion = None;
         self.prev_anchor_ticks = None;
         self.last_anchor_ticks = None;
@@ -556,7 +664,7 @@ impl Mpeg4VideoDecoder {
         };
         clock.ticks = ticks;
         clock.last_tr = Some(pic.temporal_reference);
-        if let Some(pending) = self.sequence.pending_anchor_mut() {
+        if let Some(pending) = produced_anchor(&mut self.sequence, out) {
             let (w, h) = pic.source_format.dimensions();
             stamp(pending, container_pts, ticks, (u32::from(w), u32::from(h)));
         }
@@ -576,7 +684,13 @@ impl Mpeg4VideoDecoder {
                 self.profile_level = parse_visual_object_sequence_header(unit)?;
             }
             VISUAL_OBJECT_SEQUENCE_END_CODE => {}
-            USER_DATA_START_CODE => self.encoder.read_user_data(&unit[4..]),
+            USER_DATA_START_CODE => {
+                self.encoder.read_user_data(&unit[4..]);
+                // Inverse-transform stream evidence: sticky once seen.
+                if let Some(build) = encoder_build_of(&unit[4..]) {
+                    self.encoder_build = Some(build);
+                }
+            }
             VISUAL_OBJECT_START_CODE => {
                 let _ = parse_visual_object_header(unit)?;
             }
@@ -585,8 +699,9 @@ impl Mpeg4VideoDecoder {
             }
             VIDEO_OBJECT_LAYER_START_CODE_MIN..=VIDEO_OBJECT_LAYER_START_CODE_MAX => {
                 let vol = parse_video_object_layer(unit, self.profile_level)?;
-                self.time_increment_bits =
-                    usize::from(crate::vop::vop_time_increment_bits(vol.time_increment_resolution));
+                self.time_increment_bits = usize::from(crate::vop::vop_time_increment_bits(
+                    vol.time_increment_resolution,
+                ));
                 // FFmpeg's low_delay (decode_vol_header): the VOL's own
                 // flag, else, before the first picture, set for the
                 // Simple and Advanced Simple object types.
@@ -596,6 +711,11 @@ impl Mpeg4VideoDecoder {
                         self.low_delay = matches!(vol.video_object_type_indication, 1 | 17);
                     }
                     None => {}
+                }
+                if self.vol != Some(vol) {
+                    // A different layer configuration: its sprite (if
+                    // any) arrives with its own initial I-VOP.
+                    self.sprite = None;
                 }
                 self.vol = Some(vol);
             }
@@ -630,6 +750,14 @@ impl Mpeg4VideoDecoder {
         out: &mut Vec<DecodedFrame>,
     ) -> Result<Option<usize>, StreamDecodeError> {
         let vol = self.vol.ok_or(StreamDecodeError::MissingVol)?;
+        if vol.bits_per_pixel != 8 {
+            // §6.3.3 `not_8_bit`: the picture store holds 8-bit
+            // samples; an N-bit VOL would be clipped into it, so it is
+            // declined instead.
+            return Err(StreamDecodeError::Vol(VolParseError::UnsupportedBranch(
+                "not_8_bit with bits_per_pixel != 8",
+            )));
+        }
         let (mb_width, mb_height) = vop_mb_dimensions(&vol);
         let mb_count = mb_width * mb_height;
         // Ecosystem mode places 8×8 prediction blocks as FFmpeg does
@@ -670,6 +798,18 @@ impl Mpeg4VideoDecoder {
         };
         let vop_ticks = (base_sec + u64::from(vop.modulo_time_base)) as i64 * res
             + i64::from(vop.time_increment);
+
+        if matches!(vol.sprite_enable, SpriteEnable::Static) {
+            self.decode_static_sprite_vop(
+                &vol,
+                &vop,
+                &mut br,
+                res,
+                (container_pts, vop_ticks),
+                out,
+            )?;
+            return Ok(Some(br.bit_position() / 8));
+        }
 
         if !vop.coded {
             if self.options.ecosystem_compat {
@@ -716,10 +856,10 @@ impl Mpeg4VideoDecoder {
                         &mut br,
                         &vol,
                         &vop,
-                        self.options,
+                        self.vop_options(),
                     )?
                 } else {
-                    decode_i_vop_macroblocks(&mut br, &vol, &vop, self.options)?
+                    decode_i_vop_macroblocks(&mut br, &vol, &vop, self.vop_options())?
                 };
                 out.extend(self.sequence.push_i_vop(mb_width, mb_height, &mbs)?);
                 self.anchor_motion = None;
@@ -733,10 +873,10 @@ impl Mpeg4VideoDecoder {
                         &mut br,
                         &vol,
                         &vop,
-                        self.options,
+                        self.vop_options(),
                     )?
                 } else {
-                    decode_p_vop_macroblocks(&mut br, &vol, &vop, self.options)?
+                    decode_p_vop_macroblocks(&mut br, &vol, &vop, self.vop_options())?
                 };
                 self.anchor_motion = Some(motion_of_p_entries(&entries));
                 out.extend(if vol.obmc_disable {
@@ -770,10 +910,10 @@ impl Mpeg4VideoDecoder {
                         &mut br,
                         &vol,
                         &vop,
-                        self.options,
+                        self.vop_options(),
                     )?
                 } else {
-                    decode_s_gmc_vop_macroblocks(&mut br, &vol, &vop, self.options)?
+                    decode_s_gmc_vop_macroblocks(&mut br, &vol, &vop, self.vop_options())?
                 };
                 self.anchor_motion = Some(motion_of_s_entries(&entries));
                 out.extend(self.sequence.push_s_gmc_vop(
@@ -792,9 +932,10 @@ impl Mpeg4VideoDecoder {
                     // FFmpeg decodes no picture for a B-VOP without a
                     // past anchor or with times out of order (h263dec.c
                     // ff_h263_decode_frame, decode_vop_header).
-                    Err(StreamDecodeError::MissingAnchor | StreamDecodeError::BadTemporalReference { .. })
-                        if self.options.ecosystem_compat =>
-                    {
+                    Err(
+                        StreamDecodeError::MissingAnchor
+                        | StreamDecodeError::BadTemporalReference { .. },
+                    ) if self.options.ecosystem_compat => {
                         return Ok(None);
                     }
                     Err(e) => return Err(e),
@@ -807,7 +948,7 @@ impl Mpeg4VideoDecoder {
                         trb,
                         trd,
                         self.anchor_motion.as_deref(),
-                        self.options,
+                        self.vop_options(),
                     )?;
                     let field_mode = if vol.quarter_sample {
                         crate::bvop_field_motion::FieldSampleMode::QuarterSample {
@@ -838,7 +979,7 @@ impl Mpeg4VideoDecoder {
                         trb,
                         trd,
                         self.anchor_motion.as_deref().map(|_| &progressive[..]),
-                        self.options,
+                        self.vop_options(),
                     )?;
                     out.extend(self.sequence.push_b_vop(
                         mb_width,
@@ -856,7 +997,7 @@ impl Mpeg4VideoDecoder {
         // `out` (displayed immediately); an anchor is the held
         // §6.1.3.8 pending frame.
         if is_anchor {
-            if let Some(pending) = self.sequence.pending_anchor_mut() {
+            if let Some(pending) = produced_anchor(&mut self.sequence, out) {
                 stamp(pending, container_pts, vop_ticks, visible_size(&vol));
             }
             self.advance_anchor_time(&vop, res);
@@ -864,6 +1005,133 @@ impl Mpeg4VideoDecoder {
             stamp(frame, container_pts, vop_ticks, visible_size(&vol));
         }
         Ok(Some(br.bit_position() / 8))
+    }
+
+    /// One VOP of a basic static-sprite VOL (§7.8, `sprite_enable ==
+    /// "static"`, `low_latency_sprite_enable == 0`).
+    ///
+    /// §7.8.1: the initial I-VOP is the sprite — reconstructed at
+    /// `sprite_width × sprite_height` (§7.8.2 gives the sprite arrays
+    /// those dimensions, and §6.2.5 sends no VOP size for it), stored
+    /// in the sprite memory and not displayed. Every later VOP is an
+    /// S-VOP carrying only `sprite_trajectory()` (+ the brightness
+    /// factor): it is reconstructed by warping the sprite memory
+    /// (§7.8.4 reference points, §7.8.5 warp — affine for up to three
+    /// points, perspective for four — and the §7.8.6 static sample
+    /// reconstruction).
+    fn decode_static_sprite_vop(
+        &mut self,
+        vol: &VolHeader,
+        vop: &VopHeader,
+        br: &mut BitReader<'_>,
+        res: i64,
+        (container_pts, vop_ticks): (Option<i64>, i64),
+        out: &mut Vec<DecodedFrame>,
+    ) -> Result<(), StreamDecodeError> {
+        let unsupported = |what| StreamDecodeError::Vop(VopParseError::UnsupportedBranch(what));
+        if vol.low_latency_sprite_enable.unwrap_or(false) {
+            return Err(unsupported("low_latency_sprite_enable"));
+        }
+        let geometry = vol
+            .sprite_geometry
+            .ok_or_else(|| unsupported("static sprite without geometry"))?;
+        match vop.coding_type {
+            VopCodingType::I => {
+                if !vop.coded {
+                    return Err(unsupported("static sprite I-VOP with vop_coded == 0"));
+                }
+                // The sprite I-VOP is coded on the sprite's own
+                // macroblock grid.
+                let sprite_vol = VolHeader {
+                    width: geometry.width,
+                    height: geometry.height,
+                    ..*vol
+                };
+                let (mb_width, mb_height) = vop_mb_dimensions(&sprite_vol);
+                let mbs = if vol.data_partitioned {
+                    crate::vop_decode::decode_i_vop_macroblocks_dp(
+                        br,
+                        &sprite_vol,
+                        vop,
+                        self.vop_options(),
+                    )?
+                } else {
+                    decode_i_vop_macroblocks(br, &sprite_vol, vop, self.vop_options())?
+                };
+                let mut frame = DecodedFrame::new(mb_width * 16, mb_height * 16, VopCodingType::I)
+                    .map_err(FrameDecodeError::from)?;
+                for (idx, mb) in mbs.iter().enumerate() {
+                    frame
+                        .blit_macroblock(idx % mb_width, idx / mb_width, mb)
+                        .map_err(FrameDecodeError::from)?;
+                }
+                // Crop the macroblock-aligned reconstruction to the
+                // sprite arrays (§7.8.2: sprite_width × sprite_height
+                // luminance, `// 2` chrominance).
+                self.sprite = Some(
+                    crate::static_sprite::SpritePlanes::from_aligned(
+                        frame.luma_samples(),
+                        frame.cb_samples(),
+                        frame.cr_samples(),
+                        mb_width * 16,
+                        usize::from(geometry.width),
+                        usize::from(geometry.height),
+                        i64::from(geometry.left),
+                        i64::from(geometry.top),
+                    )
+                    .ok_or_else(|| unsupported("static sprite geometry"))?,
+                );
+                self.anchor_motion = None;
+                self.advance_anchor_time(vop, res);
+                Ok(())
+            }
+            VopCodingType::S => {
+                let sprite = self
+                    .sprite
+                    .as_ref()
+                    .ok_or(StreamDecodeError::MissingAnchor)?;
+                if vol.width == 0 || vol.height == 0 {
+                    return Err(unsupported("static sprite VOP of zero size"));
+                }
+                let (mb_width, mb_height) = vop_mb_dimensions(vol);
+                let (fw, fh) = (mb_width * 16, mb_height * 16);
+                let accuracy = vol
+                    .sprite_warping_accuracy
+                    .ok_or_else(|| unsupported("static sprite without warping accuracy"))?;
+                let bpp = u32::from(vol.bits_per_pixel);
+                // `vop_coded == 0` carries no trajectory: the VOP shows
+                // the sprite through the identity warp.
+                let block = vop.static_sprite.unwrap_or(crate::vop::StaticSpriteVop {
+                    warping_points: 0,
+                    trajectory: [[0; 2]; 4],
+                    brightness_change: None,
+                });
+                let (luma, cb, cr) = crate::static_sprite::warp_static_sprite_vop(
+                    sprite,
+                    u32::from(vol.width),
+                    u32::from(vol.height),
+                    fw,
+                    fh,
+                    accuracy,
+                    bpp,
+                    block.warping_points,
+                    &block.trajectory,
+                    block.brightness_change,
+                )
+                .ok_or_else(|| unsupported("static sprite warp"))?;
+                let frame = DecodedFrame::from_planes(fw, fh, VopCodingType::S, luma, cb, cr)
+                    .map_err(FrameDecodeError::from)?;
+                out.extend(self.sequence.push_reconstructed_anchor(frame));
+                self.anchor_motion = None;
+                if let Some(pending) = produced_anchor(&mut self.sequence, out) {
+                    stamp(pending, container_pts, vop_ticks, visible_size(vol));
+                }
+                self.advance_anchor_time(vop, res);
+                Ok(())
+            }
+            // §7.8.1: a static-sprite VOL holds one I-VOP and S-VOPs.
+            _ => Err(unsupported("P/B-VOP in a static sprite VOL")),
+        }
     }
 
     /// §6.3.5 `vop_coded == 0`: the reconstructed VOP is a copy of the
@@ -925,7 +1193,7 @@ impl Mpeg4VideoDecoder {
                     sample_mode,
                     bpp,
                 )?);
-                if let Some(pending) = self.sequence.pending_anchor_mut() {
+                if let Some(pending) = produced_anchor(&mut self.sequence, out) {
                     stamp(pending, container_pts, vop_ticks, visible_size(vol));
                 }
                 self.advance_anchor_time(vop, res);
@@ -1029,9 +1297,13 @@ fn motion_of_p_entries(entries: &[PVopMbContent]) -> Vec<AnchorMbMotion> {
 ///   1-MV macroblock carrying the AMV, so a direct-mode B macroblock
 ///   scales the AMV instead of taking the skipped-co-located forward
 ///   zero-MV path.
-/// * A **coded** GMC macroblock and an intra macroblock carry no local
-///   vector — they resolve to the §7.6.9.5.1 zero-vector fallback
-///   (represented as `Intra` for the co-located adapter).
+/// * A **coded** GMC macroblock (`mcsel == 1`) carries the same AMV:
+///   §7.6.9.5.1 "The averaged motion vector defined in subclause 7.8.7.3
+///   is used as the MV of the co-located macroblock when this
+///   co-located macroblock is included in an S(GMC)-VOP and mcsel ==
+///   '1'", restated by §7.8.7.3 for the frame-based direct mode.
+/// * An intra macroblock carries no vector — the §7.6.9.5.1 zero-vector
+///   fallback (represented as `Intra` for the co-located adapter).
 fn motion_of_s_entries(entries: &[SGmcMbContent]) -> Vec<AnchorMbMotion> {
     entries
         .iter()
@@ -1047,17 +1319,24 @@ fn motion_of_s_entries(entries: &[SGmcMbContent]) -> Vec<AnchorMbMotion> {
                 top_ref: *top_field_ref,
                 bottom_ref: *bottom_field_ref,
             },
-            SGmcMbContent::Gmc {
-                amv,
-                not_coded: true,
-                ..
-            } => AnchorMbMotion::Frame(PvopMbMotion::OneMv(*amv)),
-            SGmcMbContent::Gmc {
-                not_coded: false, ..
-            }
-            | SGmcMbContent::Intra(_) => AnchorMbMotion::Frame(PvopMbMotion::Intra),
+            SGmcMbContent::Gmc { amv, .. } => AnchorMbMotion::Frame(PvopMbMotion::OneMv(*amv)),
+            SGmcMbContent::Intra(_) => AnchorMbMotion::Frame(PvopMbMotion::Intra),
         })
         .collect()
+}
+
+/// The frame the anchor VOP just pushed produced: the §6.1.3.8 held
+/// anchor in display order, or the frame appended to `out` in coded
+/// order ([`Mpeg4VideoDecoder::set_coded_order_output`]).
+fn produced_anchor<'a>(
+    sequence: &'a mut SequenceDecoder,
+    out: &'a mut [DecodedFrame],
+) -> Option<&'a mut DecodedFrame> {
+    if sequence.coded_order() {
+        out.last_mut()
+    } else {
+        sequence.pending_anchor_mut()
+    }
 }
 
 /// A forward-only zero-MV zero-residual B-VOP macroblock — the §6.3.5
@@ -1143,11 +1422,27 @@ fn to_core_error(e: StreamDecodeError) -> oxideav_core::Error {
 }
 
 impl Mpeg4PacketDecoder {
+    /// The encoder build number found in the stream's user data so far
+    /// (see [`Mpeg4VideoDecoder::detected_encoder_build`]); kept across
+    /// [`Decoder::reset`](oxideav_core::Decoder::reset).
+    pub fn detected_encoder_build(&self) -> Option<u32> {
+        self.inner.detected_encoder_build()
+    }
+
+    /// The inverse transform currently in effect (see
+    /// [`Mpeg4VideoDecoder::active_inverse_transform`]).
+    pub fn active_inverse_transform(&self) -> InverseTransformSelection {
+        self.inner.active_inverse_transform()
+    }
+
     /// Enforce the `max_pixels_per_frame` cap once a VOL is known.
     fn check_limits(&self) -> oxideav_core::Result<()> {
         let size = match &self.studio {
             Some(studio) => studio.layout().map(|(size, _)| size),
-            None => self.inner.vol().map(|vol| (u32::from(vol.width), u32::from(vol.height))),
+            None => self
+                .inner
+                .vol()
+                .map(|vol| (u32::from(vol.width), u32::from(vol.height))),
         };
         if let Some((width, height)) = size {
             if u64::from(width) * u64::from(height) > self.max_pixels {
@@ -1155,6 +1450,20 @@ impl Mpeg4PacketDecoder {
                     "mpeg4video: {width}x{height} exceeds max_pixels_per_frame {}",
                     self.max_pixels
                 )));
+            }
+            // The §7.8.2 sprite memory is a picture buffer too.
+            let sprite_geometry = match &self.studio {
+                Some(_) => None,
+                None => self.inner.vol().and_then(|vol| vol.sprite_geometry),
+            };
+            if let Some(sprite) = sprite_geometry {
+                let pixels = u64::from(sprite.width) * u64::from(sprite.height);
+                if pixels > self.max_pixels {
+                    return Err(oxideav_core::Error::resource_exhausted(format!(
+                        "mpeg4video: sprite {}x{} exceeds max_pixels_per_frame {}",
+                        sprite.width, sprite.height, self.max_pixels
+                    )));
+                }
             }
         }
         Ok(())
@@ -1224,13 +1533,23 @@ impl Mpeg4PacketDecoder {
         if let Some(studio) = &self.studio {
             return self
                 .last_output
-                .or_else(|| self.studio_ready.front().map(|f| ((f.width, f.height), f.pixel_format)))
+                .or_else(|| {
+                    self.studio_ready
+                        .front()
+                        .map(|f| ((f.width, f.height), f.pixel_format))
+                })
                 .or_else(|| studio.layout());
         }
         let yuv420 = |size| (size, oxideav_core::PixelFormat::Yuv420P);
         self.last_output
             .or_else(|| self.ready.front().map(Self::frame_size).map(yuv420))
-            .or_else(|| self.inner.sequence.pending_anchor().map(Self::frame_size).map(yuv420))
+            .or_else(|| {
+                self.inner
+                    .sequence
+                    .pending_anchor()
+                    .map(Self::frame_size)
+                    .map(yuv420)
+            })
             .or_else(|| self.inner.vol().map(visible_size).map(yuv420))
     }
 }
@@ -1252,7 +1571,9 @@ impl oxideav_core::Decoder for Mpeg4PacketDecoder {
             self.studio = Some(crate::studio::StudioDecoder::default());
         }
         if let Some(studio) = self.studio.as_mut() {
-            let frames = studio.decode_packet(&packet.data, packet.pts).map_err(to_core_error)?;
+            let frames = studio
+                .decode_packet(&packet.data, packet.pts)
+                .map_err(to_core_error)?;
             self.check_limits()?;
             self.studio_ready.extend(frames);
             return Ok(());
@@ -1272,13 +1593,14 @@ impl oxideav_core::Decoder for Mpeg4PacketDecoder {
         // packet (its placeholder), unless this packet starts a new
         // visual object sequence.
         let mut packed = std::mem::take(&mut self.packed);
-        let starts_sequence = scan_start_codes(data)
-            .first()
-            .is_some_and(|&i| u32::from_be_bytes([0, 0, 1, data[i + 3]]) == VISUAL_OBJECT_SEQUENCE_START_CODE);
+        let starts_sequence = scan_start_codes(data).first().is_some_and(|&i| {
+            u32::from_be_bytes([0, 0, 1, data[i + 3]]) == VISUAL_OBJECT_SEQUENCE_START_CODE
+        });
         if self.inner.divx_packed() && starts_sequence {
             packed.clear();
         }
-        let from_packed = !packed.is_empty() && (self.inner.divx_packed() || data.len() <= MAX_NVOP_SIZE);
+        let from_packed =
+            !packed.is_empty() && (self.inner.divx_packed() || data.len() <= MAX_NVOP_SIZE);
         let source = if from_packed { &packed[..] } else { data };
         let (frames, ended) = self
             .inner
@@ -1309,7 +1631,8 @@ impl oxideav_core::Decoder for Mpeg4PacketDecoder {
         }
         match self.ready.pop_front() {
             Some(frame) => {
-                self.last_output = Some((Self::frame_size(&frame), oxideav_core::PixelFormat::Yuv420P));
+                self.last_output =
+                    Some((Self::frame_size(&frame), oxideav_core::PixelFormat::Yuv420P));
                 Ok(oxideav_core::Frame::Video(Self::frame_to_video(&frame)))
             }
             None if self.flushed => Err(oxideav_core::Error::Eof),
@@ -1319,12 +1642,6 @@ impl oxideav_core::Decoder for Mpeg4PacketDecoder {
 
     fn output_video_dimensions(&self) -> Option<(u32, u32)> {
         self.reported_layout().map(|(size, _)| size)
-    }
-
-    /// Planar 4:2:0 at 8 bits (§6.1.3.4); 10-bit 4:2:2, 4:4:4 or RGB for
-    /// the Simple Studio Profile.
-    fn output_pixel_format(&self) -> Option<oxideav_core::PixelFormat> {
-        self.reported_layout().map(|(_, format)| format)
     }
 
     fn flush(&mut self) -> oxideav_core::Result<()> {
@@ -1348,6 +1665,30 @@ impl oxideav_core::Decoder for Mpeg4PacketDecoder {
         Ok(())
     }
 
+    /// Planar 4:2:0 at 8 bits per sample, known before the first
+    /// packet so a pipeline needs no pre-roll to label the frames.
+    ///
+    /// Every layout this decoder emits is fixed by the syntax rather
+    /// than by a per-picture choice: the VOL's `chroma_format` has a
+    /// single defined value, 4:2:0 (§6.3.3 Table 6-15 — the others are
+    /// reserved), and §6.2.5.2 short-header pictures are 4:2:0 as well;
+    /// the frame conversion always builds the Y, Cb,
+    /// Cr planes at full / half / half resolution with one byte per
+    /// sample. A VOL that arrives later (in-band, after a seek, or a
+    /// new one mid-stream) cannot change the answer.
+    ///
+    /// Once a frame has been returned (or waits in display order) the
+    /// answer is that frame's layout — the Simple Studio Profile gives
+    /// 10-bit 4:2:2, 4:4:4 or RGB, which is not known before its first
+    /// picture.
+    fn output_pixel_format(&self) -> Option<oxideav_core::PixelFormat> {
+        match self.reported_layout() {
+            Some((_, format)) => Some(format),
+            None if self.studio.is_none() => Some(oxideav_core::PixelFormat::Yuv420P),
+            None => None,
+        }
+    }
+
     fn reset(&mut self) -> oxideav_core::Result<()> {
         self.ready.clear();
         self.studio_ready.clear();
@@ -1365,8 +1706,11 @@ impl oxideav_core::Decoder for Mpeg4PacketDecoder {
             self.inner.reset_pictures();
             return Ok(());
         }
-        // Preserve the compat behaviour selection across seeks.
-        self.inner = Mpeg4VideoDecoder::with_options(self.inner.options());
+        // Preserve the compat behaviour selection — and the stream
+        // evidence that selected the inverse transform — across seeks.
+        let mut inner = Mpeg4VideoDecoder::with_options(self.inner.options());
+        inner.inherit_stream_evidence(&self.inner);
+        self.inner = inner;
         if !self.extradata.is_empty() {
             // Re-prime the configuration headers so the next packet
             // decodes against the same VOL.
@@ -1381,7 +1725,7 @@ impl oxideav_core::Decoder for Mpeg4PacketDecoder {
 /// Typed options struct for the registry / options-bag construction
 /// path ([`oxideav_core::CodecParameters::options`]).
 ///
-/// One key is recognised:
+/// Two keys are recognised:
 ///
 /// * `ecosystem-compat` (bool, default `true`) — decode as FFmpeg does
 ///   where it departs from the spec text (see [`crate::compat`]): the
@@ -1392,14 +1736,40 @@ impl oxideav_core::Decoder for Mpeg4PacketDecoder {
 ///   decode as FFmpeg's decoder takes them (first VOP only, no picture
 ///   for not-coded VOPs, DivX packed B-frames). `false` selects the
 ///   literal spec text.
+/// * `inverse-transform` (`exact` / `simple` / `variant-rc` /
+///   `from-stream`, default unset) — force the
+///   [`InverseTransformSelection`]. Unset follows the mode: `simple`
+///   for the literal-spec decode, `from-stream` under
+///   `ecosystem-compat`.
 ///
-/// Typed consumers can skip the bag and pass
-/// [`DecodeOptions`](crate::compat::DecodeOptions) to
+/// Typed consumers can skip the bag and pass [`DecodeOptions`] to
 /// [`Mpeg4VideoDecoder::with_options`] directly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Mpeg4DecoderOptions {
     /// The [`crate::compat`] ecosystem-compat switch.
     pub ecosystem_compat: bool,
+    /// Explicit inverse-transform selection (`None` follows the mode;
+    /// see [`DecodeOptions::inverse_transform`]).
+    pub inverse_transform: Option<InverseTransformSelection>,
+}
+
+impl Mpeg4DecoderOptions {
+    /// Set `ecosystem_compat`.
+    pub fn with_ecosystem_compat(mut self, v: bool) -> Self {
+        self.ecosystem_compat = v;
+        self
+    }
+
+    /// Set `inverse_transform` (an [`InverseTransformSelection`] forces
+    /// it, `None` follows the mode).
+    pub fn with_inverse_transform(
+        mut self,
+        selection: impl Into<Option<InverseTransformSelection>>,
+    ) -> Self {
+        self.inverse_transform = selection.into();
+        self
+    }
 }
 
 impl Default for Mpeg4DecoderOptions {
@@ -1407,32 +1777,61 @@ impl Default for Mpeg4DecoderOptions {
     fn default() -> Self {
         Self {
             ecosystem_compat: true,
+            inverse_transform: None,
         }
     }
 }
 
 impl From<Mpeg4DecoderOptions> for DecodeOptions {
     fn from(o: Mpeg4DecoderOptions) -> Self {
-        DecodeOptions {
-            ecosystem_compat: o.ecosystem_compat,
-        }
+        DecodeOptions::spec()
+            .with_ecosystem_compat(o.ecosystem_compat)
+            .with_inverse_transform(o.inverse_transform)
     }
 }
 
 impl oxideav_core::CodecOptionsStruct for Mpeg4DecoderOptions {
-    const SCHEMA: &'static [oxideav_core::OptionField] = &[oxideav_core::OptionField {
-        name: "ecosystem-compat",
-        kind: oxideav_core::OptionKind::Bool,
-        default: oxideav_core::OptionValue::Bool(true),
-        help: "decode as FFmpeg does where it departs from the ISO/IEC 14496-2 text \
-               (interlaced-direct co-located MVs read as zero; §7.4.4.5 mismatch control \
-               skipped on intra blocks; GMC averaged vectors; 8x8 blocks placed within the \
-               visible area; FFmpeg's packet handling) instead of the literal spec text",
-    }];
+    const SCHEMA: &'static [oxideav_core::OptionField] = &[
+        oxideav_core::OptionField {
+            name: "ecosystem-compat",
+            kind: oxideav_core::OptionKind::Bool,
+            default: oxideav_core::OptionValue::Bool(true),
+            help: "decode as FFmpeg does where it departs from the ISO/IEC 14496-2 text \
+                   (interlaced-direct co-located MVs read as zero; §7.4.4.5 mismatch control \
+                   skipped on intra blocks; GMC averaged vectors; 8x8 blocks placed within the \
+                   visible area; FFmpeg's packet handling) instead of the literal spec text; \
+                   also selects the inverse transform from stream evidence unless \
+                   inverse-transform is set",
+        },
+        oxideav_core::OptionField {
+            name: "inverse-transform",
+            kind: oxideav_core::OptionKind::Enum(&["exact", "simple", "variant-rc", "from-stream"]),
+            default: oxideav_core::OptionValue::String(String::new()),
+            help: "inverse transform for texture blocks: exact (Annex A, every stream), \
+                   simple (FFmpeg's integer simple IDCT, every stream), variant-rc (the \
+                   integer row-column transform, every stream) or from-stream (simple, then \
+                   variant-rc once a user-data unit carries the encoder signature with a build \
+                   number, for the rest of the stream); unset = simple, or from-stream under \
+                   ecosystem-compat",
+        },
+    ];
 
     fn apply(&mut self, key: &str, value: &oxideav_core::OptionValue) -> oxideav_core::Result<()> {
         match key {
             "ecosystem-compat" => self.ecosystem_compat = value.as_bool()?,
+            "inverse-transform" => {
+                self.inverse_transform = Some(match value.as_str()? {
+                    "exact" => InverseTransformSelection::Exact,
+                    "simple" => InverseTransformSelection::Simple,
+                    "variant-rc" => InverseTransformSelection::VariantRc,
+                    "from-stream" => InverseTransformSelection::FromStream,
+                    other => {
+                        return Err(oxideav_core::Error::invalid(format!(
+                            "mpeg4video: inverse-transform: unknown value {other:?}"
+                        )));
+                    }
+                })
+            }
             _ => unreachable!("guarded by SCHEMA"),
         }
         Ok(())
@@ -1467,7 +1866,9 @@ pub fn make_decoder(
     };
     if crate::studio::starts_studio(&params.extradata) {
         let mut studio = crate::studio::StudioDecoder::default();
-        studio.decode_packet(&params.extradata, None).map_err(to_core_error)?;
+        studio
+            .decode_packet(&params.extradata, None)
+            .map_err(to_core_error)?;
         dec.studio = Some(studio);
         dec.check_limits()?;
     } else if !dec.extradata.is_empty() {
@@ -1664,6 +2065,83 @@ mod tests {
     }
 
     #[test]
+    fn encoder_build_needs_the_signature_and_a_digit_run_at_offset_zero() {
+        assert_eq!(encoder_build_of(b"XviD0050"), Some(50));
+        assert_eq!(encoder_build_of(b"XviD0073 anything"), Some(73));
+        assert_eq!(encoder_build_of(b"XviD7"), Some(7));
+        assert_eq!(encoder_build_of(b"XviD"), None);
+        assert_eq!(encoder_build_of(b"XviD-beta"), None);
+        assert_eq!(encoder_build_of(b"xvid0050"), None);
+        assert_eq!(encoder_build_of(b" XviD0050"), None);
+        assert_eq!(encoder_build_of(b""), None);
+        assert_eq!(encoder_build_of(b"XviD4294967295"), Some(u32::MAX));
+        assert_eq!(encoder_build_of(b"XviD4294967296"), None);
+        assert_eq!(encoder_build_of(b"XviD00000000000000000001"), Some(1));
+    }
+
+    #[test]
+    fn user_data_evidence_is_recorded_but_only_acted_on_by_selection() {
+        // VOS + user data + VOL + I + P: the build is reported in
+        // every mode; only a from-stream selection turns it into the
+        // integer transform, and nothing turns it off again.
+        let mut w = BitWriter::default();
+        write_vos(&mut w);
+        w.write_bits(USER_DATA_START_CODE, 32);
+        for &b in b"XviD0064" {
+            w.write_bits(u32::from(b), 8);
+        }
+        write_vol(&mut w, 32, 16);
+        write_i_vop(&mut w, 2, 0);
+        write_skipped_p_vop(&mut w, 2, 1);
+        let stream = w.finish();
+
+        let mut spec = Mpeg4VideoDecoder::new();
+        assert_eq!(spec.detected_encoder_build(), None);
+        let frames = spec.decode(&stream).unwrap();
+        assert_eq!(frames.len() + spec.flush().len(), 2);
+        assert_eq!(spec.detected_encoder_build(), Some(64));
+        assert_eq!(
+            spec.active_inverse_transform(),
+            InverseTransformSelection::Simple
+        );
+        assert_eq!(
+            spec.vop_options(),
+            DecodeOptions::spec().with_inverse_transform(InverseTransformSelection::Simple)
+        );
+
+        let mut eco = Mpeg4VideoDecoder::with_options(DecodeOptions::ecosystem());
+        assert_eq!(
+            eco.active_inverse_transform(),
+            InverseTransformSelection::Simple
+        );
+        let mut frames = eco.decode(&stream).unwrap();
+        frames.extend(eco.flush());
+        assert_eq!(eco.detected_encoder_build(), Some(64));
+        assert_eq!(
+            eco.active_inverse_transform(),
+            InverseTransformSelection::VariantRc
+        );
+        assert_eq!(
+            eco.vop_options().block_transform(),
+            crate::idct::BlockTransform::VariantRc
+        );
+        // The caller's options are untouched by the resolution.
+        assert_eq!(eco.options(), DecodeOptions::ecosystem());
+        // Flat mid-grey intra blocks (F[0][0] = 1024) are 128 under
+        // either transform.
+        assert_eq!(frames[0].luma_at(0, 0), Some(128));
+        assert_eq!(frames[1].luma_at(31, 15), Some(128));
+
+        let forced = Mpeg4VideoDecoder::with_options(
+            DecodeOptions::ecosystem().with_inverse_transform(InverseTransformSelection::Exact),
+        );
+        assert_eq!(
+            forced.active_inverse_transform(),
+            InverseTransformSelection::Exact
+        );
+    }
+
+    #[test]
     fn ip_stream_decodes_in_display_order() {
         // VOS + VOL(32×16) + I(t=0) + P(t=1, all skipped) → after flush,
         // two display-order frames: the flat-128 I then its copy.
@@ -1709,6 +2187,85 @@ mod tests {
             vec![VopCodingType::I, VopCodingType::B, VopCodingType::P]
         );
         assert_eq!(frames[1].luma_at(0, 0), Some(128));
+    }
+
+    #[test]
+    fn coded_order_output_returns_each_vop_from_its_own_call() {
+        // Coding order I(t=0) P(t=2) B(t=1), fed one VOP per call with
+        // coded-order output: each call returns its own VOP's frame
+        // (I, P, B), stamped with that call's container pts, and the
+        // flush returns nothing more.
+        let mut header = BitWriter::default();
+        write_vos(&mut header);
+        write_vol(&mut header, 16, 16);
+        let mut i = BitWriter::default();
+        write_i_vop(&mut i, 1, 0);
+        let mut p = BitWriter::default();
+        write_skipped_p_vop(&mut p, 1, 2);
+        let mut b = BitWriter::default();
+        write_direct_b_vop(&mut b, 1, 1);
+
+        let mut dec = Mpeg4VideoDecoder::new();
+        dec.set_coded_order_output(true);
+        assert!(dec.decode(&header.finish()).unwrap().is_empty());
+        let mut types = Vec::new();
+        for (pts, unit) in [(0, i), (2, p), (1, b)] {
+            let frames = dec.decode_with_pts(&unit.finish(), Some(pts)).unwrap();
+            assert_eq!(frames.len(), 1);
+            assert_eq!(frames[0].pts(), Some(pts));
+            types.push(frames[0].coding_type());
+        }
+        assert_eq!(
+            types,
+            vec![VopCodingType::I, VopCodingType::P, VopCodingType::B]
+        );
+        assert!(dec.flush().is_empty());
+    }
+
+    #[test]
+    fn coded_order_frames_reorder_to_the_display_order_output() {
+        // The same I P B units decoded both ways: sorting the
+        // coded-order frames by their tick time reproduces the
+        // display-order output frame for frame (samples, pts, ticks).
+        let units = || {
+            let mut header = BitWriter::default();
+            write_vos(&mut header);
+            write_vol(&mut header, 16, 16);
+            let mut i = BitWriter::default();
+            write_i_vop(&mut i, 1, 0);
+            let mut p = BitWriter::default();
+            write_skipped_p_vop(&mut p, 1, 2);
+            let mut b = BitWriter::default();
+            write_direct_b_vop(&mut b, 1, 1);
+            (
+                header.finish(),
+                [(0, i.finish()), (2, p.finish()), (1, b.finish())],
+            )
+        };
+        let run = |coded: bool| {
+            let (header, vops) = units();
+            let mut dec = Mpeg4VideoDecoder::new();
+            dec.set_coded_order_output(coded);
+            let mut frames = dec.decode(&header).unwrap();
+            for (pts, unit) in &vops {
+                frames.extend(dec.decode_with_pts(unit, Some(*pts)).unwrap());
+            }
+            frames.extend(dec.flush());
+            frames
+        };
+        let display = run(false);
+        let mut coded = run(true);
+        coded.sort_by_key(|f| f.pts_ticks());
+        assert_eq!(display.len(), 3);
+        assert_eq!(coded.len(), display.len());
+        for (c, d) in coded.iter().zip(&display) {
+            assert_eq!(c.pts(), d.pts());
+            assert_eq!(c.pts_ticks(), d.pts_ticks());
+            assert_eq!(c.coding_type(), d.coding_type());
+            assert_eq!(c.luma_samples(), d.luma_samples());
+            assert_eq!(c.cb_samples(), d.cb_samples());
+            assert_eq!(c.cr_samples(), d.cr_samples());
+        }
     }
 
     #[test]
@@ -1942,7 +2499,7 @@ mod tests {
 
 #[cfg(test)]
 mod registry_tests {
-    use super::tests::{write_i_vop, write_skipped_p_vop, write_vol, write_vos, BitWriter};
+    use super::tests::{BitWriter, write_i_vop, write_skipped_p_vop, write_vol, write_vos};
     use super::*;
     use oxideav_core::{CodecId, CodecParameters, Packet, TimeBase};
 
@@ -2021,6 +2578,47 @@ mod registry_tests {
         assert_eq!(v.pts, Some(1)); // P-VOP tick time (tinc = 1)
         assert_eq!(v.planes[0].data[0], 128);
         assert!(matches!(dec.receive_frame(), Err(oxideav_core::Error::Eof)));
+    }
+
+    #[test]
+    fn output_pixel_format_is_stated_before_the_first_frame() {
+        // Without extradata (configuration in-band, as in AVI) and with
+        // it (MP4 decoder-specific info), the layout is answered before
+        // any packet, and the frames that follow have that shape.
+        let mut w = BitWriter::default();
+        write_vos(&mut w);
+        write_vol(&mut w, 48, 32);
+        let config = w.finish();
+        for extradata in [Vec::new(), config.clone()] {
+            let mut params = CodecParameters::video(CodecId::new("mpeg4video"));
+            params.extradata = extradata.clone();
+            let mut dec = make_decoder(&params).unwrap();
+            assert_eq!(
+                dec.output_pixel_format(),
+                Some(oxideav_core::PixelFormat::Yuv420P)
+            );
+            if extradata.is_empty() {
+                dec.send_packet(&packet(config.clone())).unwrap();
+            }
+            let mut w = BitWriter::default();
+            write_i_vop(&mut w, 6, 0); // 3×2 macroblocks
+            dec.send_packet(&packet(w.finish())).unwrap();
+            dec.flush().unwrap();
+            let oxideav_core::Frame::Video(v) = dec.receive_frame().unwrap() else {
+                panic!("expected a video frame");
+            };
+            let layout: Vec<_> = v.planes.iter().map(|p| (p.stride, p.data.len())).collect();
+            assert_eq!(layout, vec![(48, 48 * 32), (24, 24 * 16), (24, 24 * 16)]);
+            assert_eq!(
+                dec.output_pixel_format(),
+                Some(oxideav_core::PixelFormat::Yuv420P)
+            );
+            dec.reset().unwrap();
+            assert_eq!(
+                dec.output_pixel_format(),
+                Some(oxideav_core::PixelFormat::Yuv420P)
+            );
+        }
     }
 
     #[test]
@@ -2179,11 +2777,12 @@ mod registry_tests {
         assert!(max <= 2, "toggle ripple must stay small, got max {max}");
     }
     #[test]
-    fn skipped_s_gmc_colocated_maps_to_the_averaged_motion_vector() {
+    fn s_gmc_colocated_maps_to_the_averaged_motion_vector() {
         // §7.6.9.6: a skipped co-located S(GMC) macroblock is treated as
         // a NON-skipped macroblock carrying the §7.8.7.3 averaged motion
-        // vector; a coded GMC macroblock (and an intra one) keeps the
-        // §7.6.9.5.1 zero-vector fallback.
+        // vector; §7.6.9.5.1: a coded GMC (mcsel == 1) macroblock
+        // supplies the same averaged motion vector; an intra one keeps
+        // the zero-vector fallback.
         use crate::block::InterMacroblock;
         use crate::motion::MotionVector;
         use crate::reconstruct::ReconstructedMacroblock;
@@ -2212,7 +2811,7 @@ mod registry_tests {
         ];
         let motion = motion_of_s_entries(&entries);
         assert_eq!(motion[0], AnchorMbMotion::Frame(PvopMbMotion::OneMv(amv)));
-        assert_eq!(motion[1], AnchorMbMotion::Frame(PvopMbMotion::Intra));
+        assert_eq!(motion[1], AnchorMbMotion::Frame(PvopMbMotion::OneMv(amv)));
         assert_eq!(
             motion[2],
             AnchorMbMotion::Frame(PvopMbMotion::OneMv(MotionVector { x: 1, y: 2 }))

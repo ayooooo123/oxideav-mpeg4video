@@ -70,7 +70,7 @@
 //! * **Interlaced field-prediction extension** (§7.6.9 last paragraph,
 //!   alongside MVF / MVB doubling) — out of scope this round.
 
-use crate::half_sample::{interpolate_block_into, ReferenceVop};
+use crate::half_sample::{ReferenceVop, interpolate_block_into};
 use crate::motion::MotionVector;
 use crate::quarter_sample::interpolate_block_qpel_into;
 
@@ -770,7 +770,11 @@ pub fn predict_b_vop_macroblock(
             BVopSampleMode::HalfPel => 1,
             BVopSampleMode::QuarterPel { .. } => 2,
         };
-        let place = |reference: &ReferenceVop<'_>, mv: MotionVector, origin: (i32, i32), frac: u32, guard: i32| {
+        let place = |reference: &ReferenceVop<'_>,
+                     mv: MotionVector,
+                     origin: (i32, i32),
+                     frac: u32,
+                     guard: i32| {
             let (x, y) = reference.block_vector((mv.x, mv.y), origin, frac, guard);
             MotionVector { x, y }
         };

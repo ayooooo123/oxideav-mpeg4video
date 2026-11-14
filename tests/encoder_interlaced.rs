@@ -8,18 +8,18 @@
 //! (`tests/fixtures/NOTES.md`).
 
 use oxideav_mpeg4video::bvop_interlaced_encode::{
-    encode_b_vop_interlaced, BVopInterlacedEncodeStats,
+    BVopInterlacedEncodeStats, encode_b_vop_interlaced,
 };
 use oxideav_mpeg4video::decoder::Mpeg4VideoDecoder;
 use oxideav_mpeg4video::framestore::{DecodedFrame, FrameStore};
 use oxideav_mpeg4video::ivop_encode::{
-    encode_i_vop, write_configuration_headers, EncoderConfig, FrameView,
+    EncoderConfig, FrameView, encode_i_vop, write_configuration_headers,
 };
 use oxideav_mpeg4video::pvop_encode::{
-    encode_p_vop, reconstruct_own_p_vop_with_anchor_motion, PVopEncodeStats,
+    PVopEncodeStats, encode_p_vop, reconstruct_own_p_vop_with_anchor_motion,
 };
 use oxideav_mpeg4video::svop_encode::{
-    encode_s_vop, reconstruct_own_s_vop_with_anchor_motion, SVopEncodeStats,
+    SVopEncodeStats, encode_s_vop, reconstruct_own_s_vop_with_anchor_motion,
 };
 use oxideav_mpeg4video::vol::parse_video_object_layer;
 use oxideav_mpeg4video::vop_decode::AnchorMbMotion;
@@ -183,14 +183,36 @@ fn encode_ip(
     qp: u32,
 ) -> (Vec<u8>, Vec<DecodedFrame>, Vec<PVopEncodeStats>) {
     let (w, h) = (usize::from(cfg.width), usize::from(cfg.height));
+    let (stream, recons, stats, _) =
+        encode_ip_scene(cfg, frames, qp, &|k| picture(w, h, k, motion.0, motion.1));
+    (stream, recons, stats)
+}
+
+type IpEncode = (
+    Vec<u8>,
+    Vec<DecodedFrame>,
+    Vec<PVopEncodeStats>,
+    Vec<Vec<AnchorMbMotion>>,
+);
+
+/// [`encode_ip`] over an arbitrary scene; also returns every P-VOP's
+/// per-macroblock motion as the decoder reconstructs it.
+fn encode_ip_scene(
+    cfg: &EncoderConfig,
+    frames: usize,
+    qp: u32,
+    scene: &dyn Fn(usize) -> Planes,
+) -> IpEncode {
+    let (w, h) = (usize::from(cfg.width), usize::from(cfg.height));
     let (headers, vol) = vol_of(cfg);
     assert!(vol.interlaced);
     let mut stream = headers;
     let mut recons = Vec::new();
     let mut stats = Vec::new();
     let mut store = FrameStore::new();
+    let mut motions = Vec::new();
     for k in 0..frames {
-        let (y, cb, cr) = picture(w, h, k, motion.0, motion.1);
+        let (y, cb, cr) = scene(k);
         let view = FrameView {
             y: &y,
             cb: &cb,
@@ -206,13 +228,14 @@ fn encode_ip(
         } else {
             let reference = store.backward().unwrap().clone();
             let (unit, st) = encode_p_vop(&vol, cfg, &view, &reference, 0, k as u16, qp);
-            let (recon, _) = reconstruct_own_p_vop_with_anchor_motion(&vol, &unit, &mut store);
+            let (recon, motion) = reconstruct_own_p_vop_with_anchor_motion(&vol, &unit, &mut store);
             stream.extend_from_slice(&unit);
             recons.push(recon);
             stats.push(st);
+            motions.push(motion);
         }
     }
-    (stream, recons, stats)
+    (stream, recons, stats, motions)
 }
 
 /// I + 3 P over field-rate motion: field prediction and field DCT
@@ -220,12 +243,10 @@ fn encode_ip(
 /// decode is sample-exact.
 #[test]
 fn interlaced_ip_field_tools_fire_and_round_trip() {
-    let cfg = EncoderConfig {
-        width: 64,
-        height: 64,
-        interlaced: true,
-        ..EncoderConfig::default()
-    };
+    let cfg = EncoderConfig::default()
+        .with_width(64)
+        .with_height(64)
+        .with_interlaced(true);
     let (stream, recons, stats) = encode_ip(&cfg, 4, ((2, 0), (0, 0)), 4);
     let field: usize = stats.iter().map(|s| s.field).sum();
     let field_dct: usize = stats.iter().map(|s| s.field_dct).sum();
@@ -240,14 +261,12 @@ fn interlaced_ip_field_tools_fire_and_round_trip() {
 /// §7.6.2.2 per-8×8 field cascade, still sample-exact.
 #[test]
 fn interlaced_qpel_ip_round_trips() {
-    let cfg = EncoderConfig {
-        width: 64,
-        height: 48,
-        interlaced: true,
-        quarter_sample: true,
-        fcode: 2,
-        ..EncoderConfig::default()
-    };
+    let cfg = EncoderConfig::default()
+        .with_width(64)
+        .with_height(48)
+        .with_interlaced(true)
+        .with_quarter_sample(true)
+        .with_fcode(2);
     let (stream, recons, stats) = encode_ip(&cfg, 4, ((1, 0), (2, 2)), 5);
     assert!(
         stats.iter().map(|s| s.field).sum::<usize>() > 0,
@@ -261,16 +280,14 @@ fn interlaced_qpel_ip_round_trips() {
 /// inter paths; the flags survive the VOP-header round trip.
 #[test]
 fn interlaced_alternate_scan_bottom_field_first_round_trips() {
-    let cfg = EncoderConfig {
-        width: 48,
-        height: 48,
-        interlaced: true,
-        alternate_scan: true,
-        top_field_first: false,
-        four_mv: true,
-        adaptive_quant: true,
-        ..EncoderConfig::default()
-    };
+    let cfg = EncoderConfig::default()
+        .with_width(48)
+        .with_height(48)
+        .with_interlaced(true)
+        .with_alternate_scan(true)
+        .with_top_field_first(false)
+        .with_four_mv(true)
+        .with_adaptive_quant(true);
     let (stream, recons, _stats) = encode_ip(&cfg, 3, ((0, 2), (1, 0)), 6);
     let frames = decode_all(&stream);
     assert_exact(&frames, &recons);
@@ -299,12 +316,24 @@ fn encode_ipbb(
     ecosystem_compat: bool,
 ) -> (Vec<u8>, Vec<DecodedFrame>, Vec<BVopInterlacedEncodeStats>) {
     let (w, h) = (usize::from(cfg.width), usize::from(cfg.height));
+    encode_ipbb_scene(cfg, qp, ecosystem_compat, &|k| {
+        picture(w, h, k, motion.0, motion.1)
+    })
+}
+
+/// [`encode_ipbb`] over an arbitrary scene.
+fn encode_ipbb_scene(
+    cfg: &EncoderConfig,
+    qp: u32,
+    ecosystem_compat: bool,
+    view_of: &dyn Fn(usize) -> Planes,
+) -> (Vec<u8>, Vec<DecodedFrame>, Vec<BVopInterlacedEncodeStats>) {
+    let (w, h) = (usize::from(cfg.width), usize::from(cfg.height));
     let (headers, vol) = vol_of(cfg);
     let mut stream = headers;
     let mut recons: Vec<Option<DecodedFrame>> = vec![None; 7];
     let mut b_stats = Vec::new();
     let mut store = FrameStore::new();
-    let view_of = |k: usize| picture(w, h, k, motion.0, motion.1);
     // Display order 0..7, coding order: I0 P3 B1 B2 P6 B4 B5.
     let (y, cb, cr) = view_of(0);
     let (unit, recon) = encode_i_vop(
@@ -381,13 +410,11 @@ fn encode_ipbb(
 /// sample-exact through the interlaced B walk.
 #[test]
 fn interlaced_ipbb_spec_modes_fire_and_round_trip() {
-    let cfg = EncoderConfig {
-        width: 96,
-        height: 64,
-        interlaced: true,
-        b_vops: true,
-        ..EncoderConfig::default()
-    };
+    let cfg = EncoderConfig::default()
+        .with_width(96)
+        .with_height(64)
+        .with_interlaced(true)
+        .with_b_vops(true);
     let (stream, recons, stats) = encode_ipbb(&cfg, ((2, 0), (0, 0)), 4, false);
     let field: usize = stats
         .iter()
@@ -406,14 +433,12 @@ fn interlaced_ipbb_spec_modes_fire_and_round_trip() {
 /// §7.7.2.2 divergence, identical under the ecosystem-compat decode.
 #[test]
 fn interlaced_ipbb_compat_emission_avoids_interlaced_direct() {
-    let cfg = EncoderConfig {
-        width: 96,
-        height: 64,
-        interlaced: true,
-        b_vops: true,
-        quarter_sample: true,
-        ..EncoderConfig::default()
-    };
+    let cfg = EncoderConfig::default()
+        .with_width(96)
+        .with_height(64)
+        .with_interlaced(true)
+        .with_b_vops(true)
+        .with_quarter_sample(true);
     let (stream, recons, stats) = encode_ipbb(&cfg, ((1, 2), (2, 0)), 5, true);
     assert!(stats.iter().all(|s| s.interlaced_direct == 0), "{stats:?}");
     assert!(
@@ -511,12 +536,10 @@ fn registry_interlaced_options() {
 /// bit-exactly (commands + SHA-256 in `tests/fixtures/NOTES.md`).
 #[test]
 fn blackbox_interlaced_ip_stream_is_bit_exact() {
-    let cfg = EncoderConfig {
-        width: 64,
-        height: 64,
-        interlaced: true,
-        ..EncoderConfig::default()
-    };
+    let cfg = EncoderConfig::default()
+        .with_width(64)
+        .with_height(64)
+        .with_interlaced(true);
     let (stream, recons, _) = encode_ip(&cfg, 4, ((2, 0), (0, 0)), 4);
     pin_fixture("enc_ilaced_ip_64x64.m4v", &stream);
     if std::env::var_os("OXIDEAV_MPEG4VIDEO_WRITE_FIXTURES").is_some() {
@@ -536,13 +559,11 @@ fn blackbox_interlaced_ip_stream_is_bit_exact() {
 /// closed loop bit-exactly.
 #[test]
 fn blackbox_interlaced_ipbb_compat_stream_is_bit_exact() {
-    let cfg = EncoderConfig {
-        width: 96,
-        height: 64,
-        interlaced: true,
-        b_vops: true,
-        ..EncoderConfig::default()
-    };
+    let cfg = EncoderConfig::default()
+        .with_width(96)
+        .with_height(64)
+        .with_interlaced(true)
+        .with_b_vops(true);
     let (stream, recons, _) = encode_ipbb(&cfg, ((2, 0), (0, 0)), 4, true);
     pin_fixture("enc_ilaced_ipbb_compat_96x64.m4v", &stream);
     if std::env::var_os("OXIDEAV_MPEG4VIDEO_WRITE_FIXTURES").is_some() {
@@ -571,14 +592,12 @@ fn blackbox_interlaced_ipbb_compat_stream_is_bit_exact() {
 fn blackbox_interlaced_ipbb_spec_stream_diverges_only_in_interlaced_direct() {
     use oxideav_mpeg4video::compat::DecodeOptions;
     let (w, h) = (96usize, 64usize);
-    let cfg = EncoderConfig {
-        width: w as u16,
-        height: h as u16,
-        interlaced: true,
-        b_vops: true,
-        quarter_sample: true,
-        ..EncoderConfig::default()
-    };
+    let cfg = EncoderConfig::default()
+        .with_width(w as u16)
+        .with_height(h as u16)
+        .with_interlaced(true)
+        .with_b_vops(true)
+        .with_quarter_sample(true);
     let (stream, recons, stats) = encode_ipbb(&cfg, ((1, 2), (2, 0)), 5, false);
     assert!(
         stats.iter().map(|s| s.interlaced_direct).sum::<usize>() > 0,
@@ -753,15 +772,13 @@ fn encode_isbb(
 /// interlaced B-VOPs over the S anchors decode sample-exact.
 #[test]
 fn interlaced_gmc_isbb_round_trips() {
-    let cfg = EncoderConfig {
-        width: 96,
-        height: 64,
-        interlaced: true,
-        gmc: true,
-        b_vops: true,
-        fcode: 2,
-        ..EncoderConfig::default()
-    };
+    let cfg = EncoderConfig::default()
+        .with_width(96)
+        .with_height(64)
+        .with_interlaced(true)
+        .with_gmc(true)
+        .with_b_vops(true)
+        .with_fcode(2);
     let (stream, recons, s_stats, b_stats) = encode_isbb(&cfg, ((2, 0), (2, 2)), 5, false);
     let gmc: usize = s_stats.iter().map(|s| s.gmc + s.gmc_skipped).sum();
     let field: usize = s_stats.iter().map(|s| s.field).sum();
@@ -847,5 +864,133 @@ fn blackbox_interlaced_gmc_isbb_compat_stream_is_bit_exact() {
         (differing, max),
         (0, 0),
         "interlaced GMC I/S/B: {differing}/{total} samples differ (max {max})"
+    );
+}
+
+/// A smooth, aperiodic scene (integer triangle waves — deterministic
+/// on every platform) whose top field moves `top_lines` and whose
+/// bottom field moves `bottom_lines` **field lines** per frame,
+/// vertically (`mirror_right`: the right half moves the opposite
+/// way). Fast vertical field motion is what carries a field vector
+/// past the frame-unit Table 7-9 bound.
+fn fast_field_picture(
+    w: usize,
+    h: usize,
+    frame_index: usize,
+    top_lines: i64,
+    bottom_lines: i64,
+    mirror_right: bool,
+) -> Planes {
+    let tri = |v: i64, period: i64| -> i64 { (v.rem_euclid(period) - period / 2).abs() };
+    let scene = |x: i64, f: i64| -> u8 {
+        let v = 40 + tri(3 * x + 2 * f, 113) + tri(5 * f - x, 71) + tri(2 * x + f, 37);
+        v.clamp(0, 255) as u8
+    };
+    let n = frame_index as i64;
+    let (cw, ch) = (w / 2, h / 2);
+    let mut y = vec![0u8; w * h];
+    for row in 0..h {
+        let lines = if row % 2 == 0 {
+            top_lines
+        } else {
+            bottom_lines
+        };
+        // Distinct textures per field (offset 400 field lines).
+        for col in 0..w {
+            // The right half optionally moves the opposite way, so a
+            // field vector's predictor sits at the far range side.
+            let lines = if mirror_right && col >= w / 2 {
+                -lines
+            } else {
+                lines
+            };
+            let f = (row / 2) as i64 + n * lines + (row % 2) as i64 * 400;
+            y[row * w + col] = scene(col as i64, f);
+        }
+    }
+    let mut cb = vec![0u8; cw * ch];
+    let mut cr = vec![0u8; cw * ch];
+    for row in 0..ch {
+        for col in 0..cw {
+            cb[row * cw + col] = 100 + ((col / 8 + row / 8) % 5) as u8 * 6;
+            cr[row * cw + col] = 140 - ((col / 6) % 4) as u8 * 5;
+        }
+    }
+    (y, cb, cr)
+}
+
+/// Erratum E4 on the encoder side: the Table 7-9 range bounds a field
+/// vector's vertical component in **field** units, so the field
+/// estimator reaches twice the frame-line distance of a frame vector
+/// and codes the differential modulo the range width. Field motion of
+/// 11 / 12 field lines per frame under `fcode == 1` needs vertical
+/// field vectors of ±44 / ±48 frame half-samples — outside the
+/// frame-unit `[-32:31]`, inside the field-unit range.
+#[test]
+fn field_vectors_reach_the_full_field_unit_range() {
+    let (w, h) = (64usize, 128usize);
+    let cfg = EncoderConfig::default()
+        .with_width(w as u16)
+        .with_height(h as u16)
+        .with_interlaced(true);
+    let (stream, recons, stats, motions) =
+        encode_ip_scene(&cfg, 3, 4, &|k| fast_field_picture(w, h, k, 11, -12, false));
+    let mut beyond_frame_range = 0usize;
+    for motion in motions.iter().flatten() {
+        if let AnchorMbMotion::Field { mvs, .. } = motion {
+            for mv in [mvs.top, mvs.bottom] {
+                assert_eq!(mv.y % 2, 0);
+                assert!((-32..=31).contains(&(mv.y / 2)), "{mv:?}");
+                beyond_frame_range += usize::from(!(-32..=31).contains(&mv.y));
+            }
+        }
+    }
+    assert!(
+        beyond_frame_range >= 20,
+        "{beyond_frame_range} field vectors beyond the frame-unit range: {stats:?}"
+    );
+    assert!(
+        stats.iter().map(|s| s.intra).sum::<usize>() * 4 < stats.iter().map(|s| s.field).sum(),
+        "{stats:?}"
+    );
+    assert_exact(&decode_all(&stream), &recons);
+}
+
+/// Black-box pin of the field-unit range on encoder-produced content:
+/// an interlaced I/P/B stream (`fcode == 2`) whose fields move 9 field
+/// lines per frame in opposite directions — P field vectors of 27
+/// field lines (108 frame half-samples, the frame-unit bound is 63)
+/// and B field vectors of 9 / 18 lines through the four-PMV bank; the
+/// right half moves the opposite way, so at the seam the predictor
+/// sits across the range and the differential is coded reduced modulo
+/// the range width. The reference decode matches our closed loop
+/// bit-exactly.
+#[test]
+fn blackbox_interlaced_field_range_ipbb_stream_is_bit_exact() {
+    let (w, h) = (64usize, 160usize);
+    let cfg = EncoderConfig::default()
+        .with_width(w as u16)
+        .with_height(h as u16)
+        .with_interlaced(true)
+        .with_b_vops(true)
+        .with_fcode(2);
+    let (stream, recons, stats) =
+        encode_ipbb_scene(&cfg, 4, true, &|k| fast_field_picture(w, h, k, 9, -9, true));
+    let field: usize = stats
+        .iter()
+        .map(|s| s.field_forward + s.field_backward + s.field_bidirectional)
+        .sum();
+    assert!(field > 40, "field B modes: {stats:?}");
+    assert_exact(&decode_all(&stream), &recons);
+    pin_fixture("enc_ilaced_fieldrange_ipbb_64x160.m4v", &stream);
+    if std::env::var_os("OXIDEAV_MPEG4VIDEO_WRITE_FIXTURES").is_some() {
+        return;
+    }
+    let yuv = std::fs::read(fixture_path("enc_ilaced_fieldrange_ipbb_64x160.yuv")).unwrap();
+    let (differing, max, total) = diff_against_yuv(&recons, &yuv, w, h);
+    assert_eq!(
+        (differing, max),
+        (0, 0),
+        "interlaced field-range I/P/B: {differing}/{total} samples differ (max {max})"
     );
 }

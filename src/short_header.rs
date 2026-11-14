@@ -44,25 +44,25 @@
 
 use crate::bitreader::{BitReader, BitReaderError};
 use crate::block::{
-    inter_block_from_events, pattern_code, InterMacroblock, IntraMacroblock,
-    MacroblockTextureContext,
+    InterMacroblock, IntraMacroblock, MacroblockTextureContext, inter_block_from_events,
+    pattern_code,
 };
 use crate::frame_decode::PVopMbContent;
 use crate::idct::idct_8x8;
-use crate::inverse_quant::{inverse_quant_method2, InverseQuantContext};
+use crate::inverse_quant::{InverseQuantContext, inverse_quant_method2};
 use crate::macroblock::{
-    decode_cbpy4, decode_mcbpc, dquant_value, DerivedMbType, MCBPC_I, MCBPC_P,
+    DerivedMbType, MCBPC_I, MCBPC_P, decode_cbpy4, decode_mcbpc, dquant_value,
 };
 use crate::motion::{
-    decode_motion_vector_delta, predict_motion_vector, reconstruct_motion_vector, MotionVector,
-    MvMode,
+    MotionVector, MvMode, decode_motion_vector_delta, predict_motion_vector,
+    reconstruct_motion_vector,
 };
 use crate::mv_predictor_grid::MvGrid;
 use crate::pvop_mv::PvopMbMotion;
-use crate::reconstruct::{reconstruct_intra_macroblock, ReconstructedMacroblock};
-use crate::scan::{events_to_qfs, inverse_scan, ScanType};
+use crate::reconstruct::{ReconstructedMacroblock, reconstruct_intra_macroblock};
+use crate::scan::{ScanType, events_to_qfs, inverse_scan};
 use crate::texture::{
-    decode_ac_events_short_video_header, AcEvent, DcComponent, TcoefTable, TextureParseError,
+    AcEvent, DcComponent, TcoefTable, TextureParseError, decode_ac_events_short_video_header,
 };
 use crate::vop::VopCodingType;
 
@@ -198,6 +198,7 @@ impl SourceFormat {
 /// The decoded `video_plane_with_short_header()` picture header
 /// (through the `pei` loop).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ShortHeaderPicture {
     /// 8-bit `temporal_reference` (30000/1001 Hz ticks, modulo 256).
     pub temporal_reference: u8,
@@ -217,6 +218,7 @@ pub struct ShortHeaderPicture {
 
 /// Short-header parse / decode errors.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ShortHeaderError {
     /// The unit does not start with `short_video_start_marker`.
     MissingStartMarker,
@@ -441,11 +443,7 @@ pub fn intra_dc_code(dc: i32) -> u32 {
         (1..=254).contains(&dc),
         "intra DC {dc} outside the FLC domain"
     );
-    if dc == 128 {
-        255
-    } else {
-        dc as u32
-    }
+    if dc == 128 { 255 } else { dc as u32 }
 }
 
 /// The §7.4 reconstruction of one short-header **intra** block: DC ×
@@ -598,6 +596,10 @@ pub fn decode_short_header_macroblocks(
                     ac_pred_flag: false,
                     alternate_vertical_scan: false,
                     intra_mismatch_exempt: false,
+                    // Short-header pictures do not follow the stream's
+                    // inverse-transform selection: always the transform
+                    // `idct_8x8` computes for their intra blocks.
+                    transform: crate::idct::BlockTransform::Simple,
                 };
                 let mut residual = InterMacroblock::zero();
                 for (i, &is_coded) in coded.iter().enumerate() {

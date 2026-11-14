@@ -34,11 +34,12 @@
 //! separate follow-up, tracked in the crate README).
 
 use crate::half_sample::ReferenceVop;
-use crate::reconstruct::{ReconstructedMacroblock, MACROBLOCK_CHROMA_SIDE, MACROBLOCK_LUMA_SIDE};
+use crate::reconstruct::{MACROBLOCK_CHROMA_SIDE, MACROBLOCK_LUMA_SIDE, ReconstructedMacroblock};
 use crate::vop::VopCodingType;
 
 /// Errors from frame-store construction and macroblock blitting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum FrameStoreError {
     /// A zero width or height was requested, or a dimension was not a
     /// whole number of macroblocks. MPEG-4 Part 2 luma planes are an
@@ -111,8 +112,8 @@ impl DecodedFrame {
     ) -> Result<Self, FrameStoreError> {
         if width == 0
             || height == 0
-            || width % MACROBLOCK_LUMA_SIDE != 0
-            || height % MACROBLOCK_LUMA_SIDE != 0
+            || !width.is_multiple_of(MACROBLOCK_LUMA_SIDE)
+            || !height.is_multiple_of(MACROBLOCK_LUMA_SIDE)
         {
             return Err(FrameStoreError::InvalidDimensions { width, height });
         }
@@ -130,6 +131,29 @@ impl DecodedFrame {
             visible: None,
             block_clip: None,
         })
+    }
+
+    /// A frame from three ready 4:2:0 planes (`width × height` luma,
+    /// half-size chroma; both dimensions non-zero multiples of 16).
+    pub(crate) fn from_planes(
+        width: usize,
+        height: usize,
+        coding_type: VopCodingType,
+        luma: Vec<u8>,
+        cb: Vec<u8>,
+        cr: Vec<u8>,
+    ) -> Result<Self, FrameStoreError> {
+        let mut frame = Self::new(width, height, coding_type)?;
+        if luma.len() != frame.luma.len()
+            || cb.len() != frame.cb.len()
+            || cr.len() != frame.cr.len()
+        {
+            return Err(FrameStoreError::InvalidDimensions { width, height });
+        }
+        frame.luma = luma;
+        frame.cb = cb;
+        frame.cr = cr;
+        Ok(frame)
     }
 
     /// Container-supplied presentation timestamp, in the container's
@@ -271,7 +295,8 @@ impl DecodedFrame {
 
     /// FFmpeg's chrominance clip: half the visible size, rounded down.
     fn chroma_block_clip(&self) -> Option<(usize, usize)> {
-        self.block_clip.map(|(w, h)| ((w >> 1) as usize, (h >> 1) as usize))
+        self.block_clip
+            .map(|(w, h)| ((w >> 1) as usize, (h >> 1) as usize))
     }
 
     /// Blit one reconstructed macroblock into this frame at macroblock
@@ -323,7 +348,12 @@ impl DecodedFrame {
             .chunks_mut(width * MACROBLOCK_LUMA_SIDE)
             .zip(self.cb.chunks_mut(chroma_len))
             .zip(self.cr.chunks_mut(chroma_len))
-            .map(move |((luma, cb), cr)| MacroblockRowMut { luma, cb, cr, width })
+            .map(move |((luma, cb), cr)| MacroblockRowMut {
+                luma,
+                cb,
+                cr,
+                width,
+            })
     }
 
     /// Read back a single luma sample (debug / test helper). Returns
@@ -355,7 +385,10 @@ impl MacroblockRowMut<'_> {
         let x0 = mb_col * MACROBLOCK_LUMA_SIDE;
         for (dy, row) in mb.luma.iter().enumerate() {
             let base = dy * self.width + x0;
-            for (out, &sample) in self.luma[base..base + MACROBLOCK_LUMA_SIDE].iter_mut().zip(row) {
+            for (out, &sample) in self.luma[base..base + MACROBLOCK_LUMA_SIDE]
+                .iter_mut()
+                .zip(row)
+            {
                 *out = sample.clamp(0, 255) as u8;
             }
         }
@@ -363,10 +396,16 @@ impl MacroblockRowMut<'_> {
         let cx0 = mb_col * MACROBLOCK_CHROMA_SIDE;
         for (dy, (cb_row, cr_row)) in mb.cb.iter().zip(&mb.cr).enumerate() {
             let base = dy * chroma_w + cx0;
-            for (out, &sample) in self.cb[base..base + MACROBLOCK_CHROMA_SIDE].iter_mut().zip(cb_row) {
+            for (out, &sample) in self.cb[base..base + MACROBLOCK_CHROMA_SIDE]
+                .iter_mut()
+                .zip(cb_row)
+            {
                 *out = sample.clamp(0, 255) as u8;
             }
-            for (out, &sample) in self.cr[base..base + MACROBLOCK_CHROMA_SIDE].iter_mut().zip(cr_row) {
+            for (out, &sample) in self.cr[base..base + MACROBLOCK_CHROMA_SIDE]
+                .iter_mut()
+                .zip(cr_row)
+            {
                 *out = sample.clamp(0, 255) as u8;
             }
         }

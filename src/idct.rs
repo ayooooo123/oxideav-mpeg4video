@@ -156,6 +156,33 @@ pub fn saturate_idct_sample(value: i32, bits_per_pixel: u32) -> i32 {
 fn idct_1d(input: &[f64; N]) -> [f64; N] {
     let cos = cos_table();
     let scale = (2.0_f64 / N as f64).sqrt();
+    // Each output accumulates its terms in ascending `u`, exactly as
+    // the defining sum reads; the loops are nested `u`-outer so the
+    // eight accumulators advance together, and a zero input (whose
+    // term is an exact zero) is skipped. Neither changes any
+    // accumulated value.
+    let mut output = [0.0f64; N];
+    for u in 0..N {
+        if input[u] == 0.0 {
+            continue;
+        }
+        let term = c(u) * input[u];
+        for x in 0..N {
+            output[x] += term * cos[u][x];
+        }
+    }
+    for value in &mut output {
+        *value *= scale;
+    }
+    output
+}
+
+/// The defining double loop of [`idct_1d`], kept as the bit-identity
+/// reference for the restructured evaluation.
+#[cfg(test)]
+fn idct_1d_reference(input: &[f64; N]) -> [f64; N] {
+    let cos = cos_table();
+    let scale = (2.0_f64 / N as f64).sqrt();
     let mut output = [0.0f64; N];
     for x in 0..N {
         let mut acc = 0.0f64;
@@ -175,42 +202,197 @@ fn idct_1d(input: &[f64; N]) -> [f64; N] {
 /// closing sentence.
 ///
 /// The computation is a straightforward two-pass separable IDCT (row
-/// pass over `u`, column pass over `v`) in `f64`. The §4.1 rounding
-/// note ("round to nearest") is followed verbatim — half-up rounding
-/// via `(value + 0.5).floor()` on the non-negative branch and
-/// `(value - 0.5).ceil()` on the negative branch (Rust's `f64::round`
-/// rounds half-away-from-zero, which matches §4.1).
+/// pass over `u`, column pass over `v`) in `f64`, then rounded to the
+/// nearest integer. A mathematically exact half-integer (detected
+/// within [`HALF_INTEGER_TOLERANCE`], so the `f64` evaluation error
+/// cannot tip it either way) rounds away from zero, the §4 convention
+/// for half-integers; [`idct_8x8_rounded`] selects the alternative.
 pub fn idct_8x8(coefficients: &[[i32; 8]; 8], bits_per_pixel: u32) -> [[i32; 8]; 8] {
-    // 8-bit MPEG-4 (and H.263 family): use FFmpeg's integer simple_idct so
+    // 8-bit MPEG-4 (and H.263 family): FFmpeg's integer simple IDCT, so
     // decoded pixels match FFmpeg's framemd5 bit-for-bit (the reference
-    // decode of record for this ecosystem). Ported from
-    // libavcodec/simple_idct.c + simple_idct_template.c (LGPL-2.1-or-later),
-    // commit 2da55bf.
+    // decode of record for this ecosystem). Other bit depths keep the
+    // Annex A.1 `f64` path.
     if bits_per_pixel == 8 {
-        let mut block = [0i16; 64];
-        for v in 0..8 {
-            for u in 0..8 {
-                // The C path feeds int16 coefficients; quantised MPEG-4
-                // coefficients fit in i16 after inverse quantisation at
-                // 8 bpp (the f64 path tolerated wider values, but the
-                // encoder never produces them for 8-bit content).
-                block[v * 8 + u] = coefficients[v][u].clamp(-32768, 32767) as i16;
-            }
+        return simple_idct_8bit(coefficients, false);
+    }
+    idct_8x8_rounded(
+        coefficients,
+        bits_per_pixel,
+        HalfIntegerRounding::AwayFromZero,
+    )
+}
+
+/// FFmpeg's integer simple IDCT of one 8-bit block (`ffmpeg_idct`, a port
+/// of libavcodec/simple_idct.c + simple_idct_template.c, LGPL-2.1-or-later,
+/// commit 2da55bf). `signed` selects the add variant (a signed residual,
+/// clipped only after the §7.3 prediction add); otherwise the put variant
+/// clips to the display range `0..=255`.
+fn simple_idct_8bit(coefficients: &[[i32; 8]; 8], signed: bool) -> [[i32; 8]; 8] {
+    let mut block = [0i16; 64];
+    for v in 0..8 {
+        for u in 0..8 {
+            // The C path feeds int16 coefficients; quantised MPEG-4
+            // coefficients fit in i16 after inverse quantisation at
+            // 8 bpp.
+            block[v * 8 + u] = coefficients[v][u].clamp(-32768, 32767) as i16;
         }
-        let pixels = crate::ffmpeg_idct::simple_idct_put_8bit(&mut block);
-        let mut out = [[0i32; 8]; 8];
+    }
+    let mut out = [[0i32; 8]; 8];
+    if signed {
+        let pixels = crate::ffmpeg_idct::simple_idct_add_8bit(&mut block);
         for y in 0..8 {
             for x in 0..8 {
-                out[y][x] = pixels[x][y] as i32;
+                out[y][x] = i32::from(pixels[x][y]);
             }
         }
-        return out;
+    } else {
+        let pixels = crate::ffmpeg_idct::simple_idct_put_8bit(&mut block);
+        for y in 0..8 {
+            for x in 0..8 {
+                out[y][x] = i32::from(pixels[x][y]);
+            }
+        }
+    }
+    out
+}
+
+/// How [`idct_8x8_rounded`] resolves a transformed value that lies
+/// exactly half-way between two integers.
+///
+/// Annex A.1 bounds the IDCT only by accuracy (a peak error of 1
+/// against the mathematical IDCT on the item-3 set, 2 on the IEEE
+/// 1180 random sets), so either neighbour of an exact half-integer is
+/// conformant. Exact halves are common, not a corner case: a DC-only
+/// block evaluates to `F[0][0] / 8`, a half-integer whenever
+/// `F[0][0] = dc_scaler · QF[0][0]` is congruent to 4 modulo 8 (Table
+/// 7-1 `dc_scaler` values other than 8 and 16, i.e. most quantisers
+/// above 4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum HalfIntegerRounding {
+    /// Away from zero — the convention ISO/IEC 14496-2 §4 states for
+    /// its `//` operator ("Half-integer values are rounded away from
+    /// zero unless otherwise specified"). The default, spec-literal
+    /// decode.
+    #[default]
+    AwayFromZero,
+    /// To the even neighbour — the ecosystem-compat choice
+    /// ([`crate::compat`]): black-box reference decodes resolve every
+    /// exact half-integer of a DC-only block to the even neighbour
+    /// (202.5 → 202, 166.5 → 166, 203.5 → 204).
+    ToEven,
+}
+
+/// The §7.4.5 inverse transform a decode path applies to one
+/// dequantised block.
+///
+/// Annex A admits any transform within its accuracy tolerance; three
+/// are implemented. [`BlockTransform::Exact`] is the mathematical Annex
+/// A.1 transform rounded to nearest (with its half-integer rule);
+/// [`BlockTransform::VariantRc`] is the integer row–column transform of
+/// [`crate::variant_rc`]; [`BlockTransform::Simple`] is the integer
+/// "simple" transform of [`crate::ffmpeg_idct`], the one FFmpeg decodes
+/// 8-bit streams with. The integer transforms have no ties and
+/// therefore no rounding rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum BlockTransform {
+    /// [`idct_8x8_rounded`] with the given half-integer rule.
+    Exact(HalfIntegerRounding),
+    /// [`crate::variant_rc::idct_8x8_variant_rc`].
+    VariantRc,
+    /// FFmpeg's integer simple IDCT at 8 bits per pixel — clipped to
+    /// the display range on intra blocks ([`BlockTransform::apply`]), a
+    /// signed residual on inter blocks
+    /// ([`BlockTransform::apply_inter`]) — and the exact transform
+    /// (half-integers away from zero) at every other bit depth. What
+    /// [`idct_8x8`] and [`idct_8x8_inter_residual`] compute.
+    Simple,
+}
+
+impl Default for BlockTransform {
+    fn default() -> Self {
+        Self::SPEC
+    }
+}
+
+impl BlockTransform {
+    /// The literal-spec default: the exact transform, half-integers
+    /// away from zero.
+    pub const SPEC: Self = Self::Exact(HalfIntegerRounding::AwayFromZero);
+
+    /// Inverse-transform `coefficients[v][u]` and saturate to
+    /// `[-2^bits_per_pixel, 2^bits_per_pixel - 1]`.
+    ///
+    /// This is the intra form: [`BlockTransform::Simple`] clips to the
+    /// display range at 8 bits per pixel.
+    #[inline]
+    pub fn apply(self, coefficients: &[[i32; 8]; 8], bits_per_pixel: u32) -> [[i32; 8]; 8] {
+        match self {
+            Self::Exact(rounding) => idct_8x8_rounded(coefficients, bits_per_pixel, rounding),
+            Self::VariantRc => crate::variant_rc::idct_8x8_variant_rc(coefficients, bits_per_pixel),
+            Self::Simple => idct_8x8(coefficients, bits_per_pixel),
+        }
     }
 
-    // Other bit depths keep the spec-textbook f64 path.
+    /// [`Self::apply`] for an **inter residual** block:
+    /// [`BlockTransform::Simple`] keeps the signed residual at 8 bits
+    /// per pixel (see [`idct_8x8_inter_residual`]); every other case is
+    /// [`Self::apply`].
+    #[inline]
+    pub fn apply_inter(self, coefficients: &[[i32; 8]; 8], bits_per_pixel: u32) -> [[i32; 8]; 8] {
+        match self {
+            Self::Simple => idct_8x8_inter_residual(coefficients, bits_per_pixel),
+            _ => self.apply(coefficients, bits_per_pixel),
+        }
+    }
+}
+
+/// Distance from one half below which a transformed `f64` value is
+/// treated as an exact half-integer. A true half-integer comes out of
+/// the two `f64` passes within a few hundred ulps of the value
+/// (magnitudes stay below `2^12`, so under `1e-10`); a value that is
+/// not a half-integer but lies within `1e-8` of one is far rarer than
+/// one sample per million and is equally conformant either way.
+const HALF_INTEGER_TOLERANCE: f64 = 1e-8;
+
+/// Round `value` to the nearest integer, resolving exact
+/// half-integers (within [`HALF_INTEGER_TOLERANCE`]) per `rounding`.
+#[inline]
+fn round_to_integer(value: f64, rounding: HalfIntegerRounding) -> i32 {
+    let below = value.floor();
+    if (value - below - 0.5).abs() < HALF_INTEGER_TOLERANCE {
+        let below = below as i32;
+        return match rounding {
+            HalfIntegerRounding::AwayFromZero => {
+                if below >= 0 {
+                    below + 1
+                } else {
+                    below
+                }
+            }
+            HalfIntegerRounding::ToEven => below + (below & 1),
+        };
+    }
+    value.round() as i32
+}
+
+/// [`idct_8x8`] with an explicit [`HalfIntegerRounding`] for the
+/// final round-to-integer step (the transform itself is identical).
+pub fn idct_8x8_rounded(
+    coefficients: &[[i32; 8]; 8],
+    bits_per_pixel: u32,
+    rounding: HalfIntegerRounding,
+) -> [[i32; 8]; 8] {
     // Row pass: 1-D IDCT on each row of F (varying u for each fixed v).
     let mut row_out = [[0.0f64; N]; N];
+    let mut row_coded = [false; N];
     for v in 0..N {
+        // An all-zero coefficient row transforms to zeros.
+        if coefficients[v] == [0i32; N] {
+            continue;
+        }
+        row_coded[v] = true;
         let mut row_in = [0.0f64; N];
         for u in 0..N {
             row_in[u] = coefficients[v][u] as f64;
@@ -219,16 +401,33 @@ pub fn idct_8x8(coefficients: &[[i32; 8]; 8], bits_per_pixel: u32) -> [[i32; 8];
     }
 
     // Column pass: 1-D IDCT on each column of the row-pass output
-    // (varying v for each fixed x).
+    // (varying v for each fixed x). The eight columns advance
+    // together: every `full[y][x]` accumulates its terms
+    // `c(v) · row_out[v][x] · cos[v][y]` in ascending `v`, exactly the
+    // per-column sum, and a row of the row pass that is entirely zero
+    // (its terms are exact zeros) is skipped.
+    let cos = cos_table();
+    let scale = (2.0_f64 / N as f64).sqrt();
     let mut full = [[0.0f64; N]; N];
-    for x in 0..N {
-        let mut col_in = [0.0f64; N];
-        for v in 0..N {
-            col_in[v] = row_out[v][x];
+    for v in 0..N {
+        if !row_coded[v] {
+            continue;
         }
-        let col_out = idct_1d(&col_in);
+        let cv = c(v);
+        let mut term = [0.0f64; N];
+        for x in 0..N {
+            term[x] = cv * row_out[v][x];
+        }
         for y in 0..N {
-            full[y][x] = col_out[y];
+            let k = cos[v][y];
+            for x in 0..N {
+                full[y][x] += term[x] * k;
+            }
+        }
+    }
+    for row in &mut full {
+        for value in row {
+            *value *= scale;
         }
     }
 
@@ -237,8 +436,7 @@ pub fn idct_8x8(coefficients: &[[i32; 8]; 8], bits_per_pixel: u32) -> [[i32; 8];
     let mut out = [[0i32; 8]; 8];
     for y in 0..N {
         for x in 0..N {
-            let rounded = full[y][x].round() as i32;
-            out[y][x] = rounded.clamp(lo, hi);
+            out[y][x] = round_to_integer(full[y][x], rounding).clamp(lo, hi);
         }
     }
     out
@@ -254,20 +452,7 @@ pub fn idct_8x8(coefficients: &[[i32; 8]; 8], bits_per_pixel: u32) -> [[i32; 8];
 /// every inter block with negative coefficients.
 pub fn idct_8x8_inter_residual(coefficients: &[[i32; 8]; 8], bits_per_pixel: u32) -> [[i32; 8]; 8] {
     if bits_per_pixel == 8 {
-        let mut block = [0i16; 64];
-        for v in 0..8 {
-            for u in 0..8 {
-                block[v * 8 + u] = coefficients[v][u].clamp(-32768, 32767) as i16;
-            }
-        }
-        let pixels = crate::ffmpeg_idct::simple_idct_add_8bit(&mut block);
-        let mut out = [[0i32; 8]; 8];
-        for y in 0..8 {
-            for x in 0..8 {
-                out[y][x] = pixels[x][y] as i32;
-            }
-        }
-        return out;
+        return simple_idct_8bit(coefficients, true);
     }
     // Non-8-bpp inter residuals keep the spec f64 path (the same transform
     // the intra route takes; the caller clips after the prediction add).
@@ -277,6 +462,142 @@ pub fn idct_8x8_inter_residual(coefficients: &[[i32; 8]; 8], bits_per_pixel: u32
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The separable transform written directly from the defining
+    /// 1-D sum (row pass, then one column at a time), with the same
+    /// final rounding.
+    fn idct_8x8_reference(
+        coefficients: &[[i32; 8]; 8],
+        bits_per_pixel: u32,
+        rounding: HalfIntegerRounding,
+    ) -> [[i32; 8]; 8] {
+        let mut row_out = [[0.0f64; N]; N];
+        for v in 0..N {
+            let mut row_in = [0.0f64; N];
+            for u in 0..N {
+                row_in[u] = coefficients[v][u] as f64;
+            }
+            row_out[v] = idct_1d_reference(&row_in);
+        }
+        let (lo, hi) = idct_saturation_bounds(bits_per_pixel);
+        let mut out = [[0i32; 8]; 8];
+        for x in 0..N {
+            let mut col_in = [0.0f64; N];
+            for v in 0..N {
+                col_in[v] = row_out[v][x];
+            }
+            let col_out = idct_1d_reference(&col_in);
+            for y in 0..N {
+                out[y][x] = round_to_integer(col_out[y], rounding).clamp(lo, hi);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn restructured_8x8_transform_equals_the_defining_evaluation() {
+        // Dense, sparse, DC-only and single-row / single-column
+        // blocks (half-integer ties included), both tie rules.
+        let mut state = 0x0BAD_5EEDu32;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state
+        };
+        for round in 0..30_000u32 {
+            let mut block = [[0i32; 8]; 8];
+            match round % 6 {
+                0 => {
+                    for cell in block.iter_mut().flatten() {
+                        *cell = (next() % 4096) as i32 - 2048;
+                    }
+                }
+                1 => {
+                    for cell in block.iter_mut().flatten() {
+                        if next() % 8 == 0 {
+                            *cell = (next() % 1024) as i32 - 512;
+                        }
+                    }
+                }
+                2 => block[0][0] = (next() % 4096) as i32 - 2048,
+                3 => {
+                    let v = (next() % 8) as usize;
+                    for cell in block[v].iter_mut() {
+                        *cell = (next() % 512) as i32 - 256;
+                    }
+                }
+                4 => {
+                    let u = (next() % 8) as usize;
+                    for row in block.iter_mut() {
+                        row[u] = (next() % 512) as i32 - 256;
+                    }
+                }
+                _ => {
+                    // Multiples of four on the DC cell and one AC
+                    // cell: frequent exact half-integers.
+                    block[0][0] = 4 * ((next() % 512) as i32 - 256);
+                    let (v, u) = ((next() % 8) as usize, (next() % 8) as usize);
+                    block[v][u] += 4 * ((next() % 64) as i32 - 32);
+                }
+            }
+            for rounding in [
+                HalfIntegerRounding::AwayFromZero,
+                HalfIntegerRounding::ToEven,
+            ] {
+                assert_eq!(
+                    idct_8x8_rounded(&block, 8, rounding),
+                    idct_8x8_reference(&block, 8, rounding),
+                    "round {round}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn restructured_1d_pass_is_value_identical_to_the_defining_sum() {
+        // Dense, sparse and single-coefficient inputs: every output of
+        // the restructured pass equals the defining double loop (an
+        // exact zero may differ in sign only).
+        let mut state = 0x1234_5678u32;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state
+        };
+        for round in 0..20_000 {
+            let mut input = [0.0f64; N];
+            for v in input.iter_mut() {
+                let r = next();
+                let keep = match round % 4 {
+                    0 => true,
+                    1 => r & 3 == 0,
+                    2 => r & 15 == 0,
+                    _ => r & 1 == 0,
+                };
+                if keep {
+                    // Integer-valued (row pass) and fractional (column
+                    // pass) magnitudes.
+                    let int = f64::from((next() % 4096) as i32 - 2048);
+                    *v = if round % 2 == 0 {
+                        int
+                    } else {
+                        int + f64::from(next() % 1000) / 1024.0 * 0.731
+                    };
+                }
+            }
+            let (got, want) = (idct_1d(&input), idct_1d_reference(&input));
+            for x in 0..N {
+                assert!(
+                    got[x] == want[x],
+                    "round {round} x {x}: {} vs {}",
+                    got[x],
+                    want[x]
+                );
+            }
+        }
+    }
 
     /// Round-trip helper: forward 8×8 orthonormal DCT for tests.
     ///
@@ -310,6 +631,71 @@ mod tests {
             }
         }
         out
+    }
+
+    fn dc_only(dc: i32) -> [[i32; 8]; 8] {
+        let mut f = [[0i32; 8]; 8];
+        f[0][0] = dc;
+        f
+    }
+
+    #[test]
+    fn exact_halves_round_per_the_selected_rule() {
+        // A DC-only block evaluates to F[0][0] / 8 on every sample.
+        // (F[0][0], away-from-zero, to-even)
+        for (dc, away, even) in [
+            (1620, 203, 202), // 202.5
+            (1628, 204, 204), // 203.5
+            (1332, 167, 166), // 166.5
+            (4, 1, 0),        // 0.5
+            (12, 2, 2),       // 1.5
+            (-4, -1, 0),      // -0.5
+            (-12, -2, -2),    // -1.5
+            (-1620, -203, -202),
+        ] {
+            let f = dc_only(dc);
+            let a = idct_8x8_rounded(&f, 8, HalfIntegerRounding::AwayFromZero);
+            let e = idct_8x8_rounded(&f, 8, HalfIntegerRounding::ToEven);
+            assert!(a.iter().flatten().all(|&v| v == away), "{dc}: away {a:?}");
+            assert!(e.iter().flatten().all(|&v| v == even), "{dc}: even {e:?}");
+            assert_eq!(
+                BlockTransform::SPEC.apply(&f, 8),
+                a,
+                "{dc}: the spec transform is the away rule"
+            );
+            // Away from 8 bits per pixel `idct_8x8` is that transform
+            // (at 8 it is the integer simple IDCT).
+            assert_eq!(
+                idct_8x8(&f, 12),
+                idct_8x8_rounded(&f, 12, HalfIntegerRounding::AwayFromZero),
+                "{dc}: idct_8x8 is the away rule"
+            );
+        }
+    }
+
+    #[test]
+    fn non_half_values_round_identically_under_both_rules() {
+        // Away from the halves the two rules agree: a spread of DC
+        // levels plus a textured block.
+        for dc in [-2047, -1001, -9, -3, 3, 9, 1001, 2047] {
+            let f = dc_only(dc);
+            assert_eq!(
+                idct_8x8_rounded(&f, 8, HalfIntegerRounding::AwayFromZero),
+                idct_8x8_rounded(&f, 8, HalfIntegerRounding::ToEven),
+                "{dc}"
+            );
+        }
+        let mut f = [[0i32; 8]; 8];
+        for (v, row) in f.iter_mut().enumerate() {
+            for (u, c) in row.iter_mut().enumerate() {
+                *c = ((u * 37 + v * 11) % 41) as i32 - 20;
+            }
+        }
+        f[0][0] = 803;
+        assert_eq!(
+            idct_8x8_rounded(&f, 8, HalfIntegerRounding::AwayFromZero),
+            idct_8x8_rounded(&f, 8, HalfIntegerRounding::ToEven)
+        );
     }
 
     #[test]

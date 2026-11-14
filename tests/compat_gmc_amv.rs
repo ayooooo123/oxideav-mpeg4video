@@ -15,7 +15,7 @@ use oxideav_mpeg4video::compat::DecodeOptions;
 use oxideav_mpeg4video::decoder::Mpeg4VideoDecoder;
 use oxideav_mpeg4video::framestore::DecodedFrame;
 use oxideav_mpeg4video::ivop_encode::{
-    encode_i_vop, write_configuration_headers, EncoderConfig, FrameView,
+    EncoderConfig, FrameView, encode_i_vop, write_configuration_headers,
 };
 use oxideav_mpeg4video::svop_encode::write_s_vop_header;
 use oxideav_mpeg4video::vlc_encode::{put_cbpy, put_mcbpc_p, put_motion_vector};
@@ -43,14 +43,12 @@ fn maybe_write_fixture(name: &str, bytes: &[u8]) -> bool {
 /// rest are `not_coded` GMC copies.
 fn craft_probe_stream(quarter_sample: bool, du: i32, dv: i32) -> Vec<u8> {
     let (w, h) = (64usize, 64usize);
-    let cfg = EncoderConfig {
-        width: w as u16,
-        height: h as u16,
-        gmc: true,
-        quarter_sample,
-        fcode: 2,
-        ..EncoderConfig::default()
-    };
+    let cfg = EncoderConfig::default()
+        .with_width(w as u16)
+        .with_height(h as u16)
+        .with_gmc(true)
+        .with_quarter_sample(quarter_sample)
+        .with_fcode(2);
     let headers = write_configuration_headers(&cfg);
     let pos = headers
         .windows(4)

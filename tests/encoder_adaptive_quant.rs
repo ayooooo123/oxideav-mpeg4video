@@ -7,7 +7,7 @@ use oxideav_mpeg4video::bvop_encode::encode_b_vop;
 use oxideav_mpeg4video::decoder::Mpeg4VideoDecoder;
 use oxideav_mpeg4video::framestore::{DecodedFrame, FrameStore};
 use oxideav_mpeg4video::ivop_encode::{
-    encode_i_vop, write_configuration_headers, EncoderConfig, FrameView,
+    EncoderConfig, FrameView, encode_i_vop, write_configuration_headers,
 };
 use oxideav_mpeg4video::pvop_encode::{encode_p_vop, reconstruct_own_p_vop_with_motion};
 use oxideav_mpeg4video::vol::parse_video_object_layer;
@@ -78,17 +78,12 @@ fn assert_self_decodes(stream: &[u8], recons: &[DecodedFrame]) {
 fn ip_dquant_round_trips_and_is_emitted() {
     let (w, h) = (96usize, 48usize);
     for quant_type in [false, true] {
-        let cfg = EncoderConfig {
-            width: w as u16,
-            height: h as u16,
-            quant_type,
-            adaptive_quant: true,
-            ..EncoderConfig::default()
-        };
-        let plain = EncoderConfig {
-            adaptive_quant: false,
-            ..cfg
-        };
+        let cfg = EncoderConfig::default()
+            .with_width(w as u16)
+            .with_height(h as u16)
+            .with_quant_type(quant_type)
+            .with_adaptive_quant(true);
+        let plain = cfg.with_adaptive_quant(false);
         let (headers, vol) = vol_of(&cfg);
         let mut stream = headers.clone();
         let mut plain_stream = headers;
@@ -137,14 +132,12 @@ fn ip_dquant_round_trips_and_is_emitted() {
 #[test]
 fn dquant_with_inter4v_and_qpel_round_trips() {
     let (w, h) = (80usize, 48usize);
-    let cfg = EncoderConfig {
-        width: w as u16,
-        height: h as u16,
-        four_mv: true,
-        quarter_sample: true,
-        adaptive_quant: true,
-        ..EncoderConfig::default()
-    };
+    let cfg = EncoderConfig::default()
+        .with_width(w as u16)
+        .with_height(h as u16)
+        .with_four_mv(true)
+        .with_quarter_sample(true)
+        .with_adaptive_quant(true);
     let (headers, vol) = vol_of(&cfg);
     let mut stream = headers;
     let mut recons = Vec::new();
@@ -179,13 +172,11 @@ fn dquant_with_inter4v_and_qpel_round_trips() {
 #[test]
 fn b_vop_dbquant_round_trips_and_is_emitted() {
     let (w, h) = (96usize, 48usize);
-    let cfg = EncoderConfig {
-        width: w as u16,
-        height: h as u16,
-        b_vops: true,
-        adaptive_quant: true,
-        ..EncoderConfig::default()
-    };
+    let cfg = EncoderConfig::default()
+        .with_width(w as u16)
+        .with_height(h as u16)
+        .with_b_vops(true)
+        .with_adaptive_quant(true);
     let (headers, vol) = vol_of(&cfg);
     let mut stream = headers;
     let mut store = FrameStore::new();

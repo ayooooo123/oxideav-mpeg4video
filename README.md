@@ -60,7 +60,17 @@ several defects; this decoder implements the corrected readings
 valid zero MV candidates, and the f_code==1 direct-delta rule), each
 **black-box-arbitrated** against a conformant interlaced direct-mode
 B-frame stream (docs fixture, refs #176), plus the field-grid
-vertical arithmetic the §7.7.2 evenness invariant requires. The
+vertical arithmetic the §7.7.2 evenness invariant requires. **Erratum
+E4** — the Table 7-9 range bounds a field vector's vertical component
+in *field* units (`Py / 2 + MVDy` reduced into `[low:high]`, then
+doubled) — holds for P-VOP field vectors and for the interlaced B-VOP
+four-PMV bank: the two staged `interlaced-field-mv-range` streams
+decode **bit-exact** with all 134 traced field vectors reproduced
+(`tests/field_mv_range.rs`), and the encoder's field estimator
+searches that whole field-unit range (a field vector reaches twice
+the frame-line distance of a frame vector; differentials coded modulo
+the range width — black-box bit-exact on an encoder-produced I/P/B
+stream with reduced B field sums). The
 long-standing interlaced-direct deviation is now **root-caused**: an
 exhaustive per-macroblock-field pixel search (12 uniquely-determined
 macroblock-fields, all consistent) proves the reference decoder
@@ -188,8 +198,8 @@ or residual, with the luminance permuted per Figure 6-12 before the
 transform; §7.7.2.1 **field-predicted P macroblocks** — one vector per
 output field against the better reference-field parity, estimated
 through the decoder's own field `mc` / §7.6.2.2 field cascade, coded
-against the shared CASE 1/2/3 predictor on the field grid and confined
-to the Table 7-9 range; §7.7.2.2 **interlaced B modes** — field
+against the shared CASE 1/2/3 predictor on the field grid over the
+whole field-unit Table 7-9 range; §7.7.2.2 **interlaced B modes** — field
 forward / backward / bidirectional through the Table 7-14 four-PMV
 bank shared with the frame modes, and **interlaced direct** over a
 field-predicted co-located anchor with its Table 7-16 δ-corrected
@@ -256,12 +266,37 @@ Two-pass on a 60-frame GOP-12 / bf-2 run at 250 kb/s lands at 1.000
 `encoder::make_encoder` / `Mpeg4VideoEncoder` (options `qp`,
 `mpeg-quant`, `ac-pred`, `four-mv`, `qpel`, `bf`, `bitrate`,
 `vbv-buffer`, `gop-size`, `fcode`, `mb-aq`, `packet-bits`,
-`data-partitioned`, `rvlc`, `gmc`, `gmc-points`, `interlaced`, `top-field-first`,
+`data-partitioned`, `rvlc`, `gmc`, `gmc-points`, `static-sprite`,
+`sprite-points`, `interlaced`, `top-field-first`,
 `alt-scan`, `ecosystem-compat`, `short-header`, `gob-headers`,
 `dc-vlc-thr`, `auto-dc-vlc`, `rc-mode`, `rc-band`, `pass`,
 `stats-file`) is the dual-API sibling of `make_decoder`;
 `Mpeg4VideoEncoder::first_pass_stats` / `with_first_pass_stats` are the
 direct-API two-pass round trip.
+
+**Basic static sprites** (§7.8, `sprite_enable == "static"`,
+`low_latency_sprite_enable == 0`), both directions. The stream decoder
+reconstructs the VOL's initial I-VOP on the sprite's own macroblock
+grid (`sprite_width × sprite_height`, the §7.8.2 sprite arrays) into
+the sprite memory without displaying it, and rebuilds every following
+S-VOP — which carries only `sprite_trajectory()` and the optional
+`brightness_change_factor()` — by the §7.8.4 reference points, the
+§7.8.5 warp (stationary / translation / affine family for 0..=3
+warping points, perspective for 4) and the §7.8.6 static sample
+reconstruction, at any of the four warp accuracies and any sprite
+origin. The encoder's `static-sprite` option (direct API:
+`sprite_encode::StaticSpriteEncoder` over
+`EncoderConfig::with_static_sprite`, Main profile) codes the sprite
+once and then one trajectory-only S-VOP per picture, the trajectory
+fitted on the decoder's own warp of the closed-loop sprite (a coarse
+scan of the picture over the sprite, then a multi-scale descent over
+every transmitted `du[i]` / `dv[i]`) or supplied by the caller. A pan
+over a larger panorama is recovered exactly; a known three-point warp
+is fitted to within the sprite's quantisation error; every warp class
+decodes sample-exact against the encoder's closed loop
+(`tests/static_sprite.rs`). This pair is verified against itself
+only: the black-box decoder used elsewhere reads the VOL as a static
+sprite and then declines it, so no independent decode exists yet.
 
 ## Compatibility modes
 
@@ -290,7 +325,12 @@ docs carry the full write-up):
    and pinned by the `dec_sgmc_*` fixture pairs
    (`tests/compat_gmc_amv.rs`): a full encoder-produced
    negative-trajectory S(GMC) stream decodes **bit-exact** against
-   the reference decoder under ecosystem-compat.
+   the reference decoder under ecosystem-compat. The adjustment is
+   scoped to **translational warps at half-sample sprite accuracy**
+   (`s == 2`, the case those probes exercise); zooms, multi-point
+   warps and finer accuracies (1/4, 1/8, 1/16 — the XviD layout)
+   follow §7.8.7.3 in both modes and decode bit-exact against the
+   reference that way.
 4. **8×8 block placement** — FFmpeg clips the integer source position
    of an 8×8 prediction block (four-vector macroblocks, and direct
    macroblocks over a four-vector co-located macroblock or in a
@@ -304,22 +344,101 @@ docs carry the full write-up):
    the last picture of a low-delay stream that ends with a not-coded
    VOP once more.
 
+Within tolerance, also switched by the compat mode: **IDCT exact
+half-integers.** Annex A bounds the IDCT by accuracy only (peak error
+≤ 1 against the mathematical transform), so an exact half-integer may
+round either way. The default rounds it away from zero (§4's
+half-integer convention); ecosystem-compat rounds it to the **even**
+neighbour, as the reference decodes do (202.5 → 202, 203.5 → 204).
+These halves are common, not corner cases: a DC-only block is
+`F[0][0] / 8`, a half-integer whenever `dc_scaler · QF[0][0] ≡ 4
+(mod 8)` — most quantisers above 4. On a plain 300-frame
+reference-encoder AVI (qscale 2–31 under rate control) this alone took
+the default decode to 5/300 frames identical with the floating-point
+reference decode (mean error 0.09, from tie drift through P chains);
+the compat decode matches 270/300 frames exactly (peak 1, mean
+< 0.0001). Pinned by `ties_q6_96x64` (`compat_idct_rounds_exact_halves_to_even`).
+The remaining distance to a *default* reference decode is that
+decoder's own integer IDCT, which differs from its floating-point one
+by the same amount (peak 1 per intra pass, 0.25–0.6 % of samples,
+drifting to peak 3 inside a 12-frame GOP) — inside the Annex A bound.
+
+Also within tolerance: **which inverse transform.** One widespread
+encoder family — the one that signs its streams with a user-data
+string beginning `XviD` — reconstructs with a specific integer
+row–column transform, so the exact transform decodes those streams a
+level off here and there and drifts along each chain of predicted
+pictures until the next intra picture. The decoder implements that
+transform ("variant RC", `variant_rc`, written from
+`docs/video/mpeg4-visual/integer-idct-ecosystem-variant.md`; all 64
+staged black-box vectors and every worked example reproduce) and
+selects it through `InverseTransformSelection`:
+
+| Selection | Transform |
+|---|---|
+| `Exact` | Annex A.1 for every stream. The literal-spec default — **it never switches on stream content.** |
+| `FromStream` | Annex A.1 until a user-data unit (`00 00 01 B2`) whose payload *begins* with `XviD` immediately followed by decimal digits (the build number) has been decoded; variant RC for every texture block from then on, for the rest of the decoder's life. What ecosystem-compat selects. |
+| `VariantRc` | Variant RC for every stream. |
+
+`DecodeOptions::with_inverse_transform(..)` (registry key
+`inverse-transform` = `exact` / `variant-rc` / `from-stream`) forces a
+selection in either mode; `Mpeg4VideoDecoder::detected_encoder_build()`
+reports the parsed build number (in every mode) and
+`active_inverse_transform()` the transform in effect. Variant RC
+replaces the inverse DCT call only — intra and inter blocks, luminance
+and chrominance, I-/P-/B-/S(GMC)-VOPs and the static-sprite I-VOP,
+combined and data-partitioned syntax, progressive and interlaced;
+short-header pictures keep the exact transform, and mismatch control /
+the intra exemption keep their own switches (the half-integer rule is
+unused while it is active). A later non-matching user-data unit, a
+repeated configuration header or `Decoder::reset` does not revert the
+choice. Every other stream decodes byte-identically to before: the
+whole committed corpus is pinned signed and unsigned in both modes
+(`tests/inverse_transform_selection.rs`).
+
+Not verified against the encoder family itself: no encoder of that
+family was available to produce a signed stream, so the stream-level
+claim (bit-exact decode of such streams) rests on the specification
+document; the transform is verified against its staged vectors, the
+selection rule against the document's evidence table. The "empty row"
+rule (a row 0 of `(−4, 0, …, 0)` passes the row stage unchanged) is
+exercised by no staged vector and is pinned from the document's worked
+example alone.
+
+Not a divergence: §7.6.9.5.1 makes a co-located S(GMC) macroblock with
+`mcsel == 1` — coded or skipped — supply its §7.8.7.3 averaged motion
+vector to B-VOP direct mode, and both modes follow it (black-box GMC
+streams with B-VOPs decode bit-exact against the reference that way).
+
+In this fork a fourth selection, `Simple`, is what an unset selection
+resolves to (and what `FromStream` uses until the signature is seen):
+FFmpeg's integer simple IDCT at 8 bits per pixel (`ffmpeg_idct`, put
+semantics on intra blocks, add semantics on inter residuals; the exact
+transform at other depths). It is the transform the reference decodes
+of record are made with (`ffmpeg -idct simple`), and `idct_8x8` — hence
+the encoder's reconstruction loop and short-header pictures — computes
+it too. `Exact` (registry `inverse-transform=exact`) still selects the
+Annex A.1 transform with the mode's half-integer rule described
+above.
+
 Selection is wired through every decode surface:
 
 * typed: `Mpeg4VideoDecoder::with_options(DecodeOptions::ecosystem())`
   (default `new()` / `DecodeOptions::spec()` is the literal spec);
   every `vop_decode` macroblock walk takes the same `DecodeOptions`;
-* registry / options bag: key **`ecosystem-compat`** (bool, default
-  `true`) on `CodecParameters::options`, declared by the
-  `Mpeg4DecoderOptions` schema and parsed in `make_decoder`; the
-  selection survives `Decoder::reset`, which keeps the headers in force
-  as FFmpeg's flush does.
+* registry / options bag: keys **`ecosystem-compat`** (bool, default
+  `true`) and **`inverse-transform`** (`exact` / `simple` /
+  `variant-rc` / `from-stream`, default unset = the mode's own) on
+  `CodecParameters::options`, declared by the `Mpeg4DecoderOptions`
+  schema and parsed in `make_decoder`; the selection — and the stream
+  evidence already gathered — survives `Decoder::reset`, which keeps
+  the headers in force as FFmpeg's flush does.
 
 Measured effect (`tests/conformance.rs` `compat_*` pins): the
 `mpeg_quant` I/P/B stream collapses from a 3062-sample envelope to 4
 near-tie samples, the interlaced I/P/B stream from 650 samples to 7
 near-ties, and the 176×144 interlaced-direct stream from 6202 samples
-(max 114) to 2777 (0.29 %, max 64) with 29/30 interlaced-direct
+(max 114) to 380 (0.04 %, max 64, 22/25 frames exact) with 29/30 interlaced-direct
 macroblocks bit-exact, and the interlaced qpel-IPB stream (whose
 direct macroblocks compensate through the §7.6.2.2 field cascade)
 from 582 samples to **fully bit-exact** — the single 176×144 residual
@@ -482,7 +601,10 @@ both modes' envelopes are pinned).
   anchors), `assemble_s_gmc_vop_frame` (§7.8.7.1 per-MB warped/local
   `mcsel` selection). The [`sequence::SequenceDecoder`] applies §6.1.3.8
   VOP reordering — a one-slot anchor delay that turns a coding-order VOP
-  stream into display order (`1I 4P 2B 3B` → `1I 2B 3B 4P`).
+  stream into display order (`1I 4P 2B 3B` → `1I 2B 3B 4P`); opt-in
+  coded-order output (`Mpeg4VideoDecoder::set_coded_order_output`)
+  instead returns every VOP from the call that decodes it, leaving the
+  reorder to the container's presentation times.
 - **Half-sample / quarter-sample** motion compensation, OBMC, and the
   padding stages (sample / vertical / extended / interlaced).
 - **RVLC error recovery — now driven end-to-end**: the §E.1.4.4.2.1
@@ -567,31 +689,22 @@ both modes' envelopes are pinned).
   transform bodies). What remains is calling it from the residual loop
   with the per-block `opaque_pels` count and `f_shape` derived from the
   decoded binary shape of the current macroblock.
-- The §7.8.3 low-latency static-sprite piece-update machinery. The
-  **basic** static sprite (`low_latency_sprite_enable == 0`) warps the
-  §7.8.2 sprite memory onto the visible VOP via the §7.8.6 static blend
-  (incl. the `brightness_change_factor` post-adjustment). The
-  **low-latency** syntax shell is now parsed too: `sprite_piece` decodes
-  the §6.2.5.4 `decode_sprite_piece()` header (`piece_quant` /
-  `piece_width` / `piece_height` / `piece_xoffset` / `piece_yoffset`),
-  the Table 6-26 `sprite_transmit_mode` (stop / piece / update / pause)
-  with its `do {…} while` piece loop (`drive_sprite_piece_loop`), the
-  Table B.35 `brightness_change_factor()` VLC, and the composed §6.2.5
-  static S-VOP block (`parse_static_sprite_vop_block` — trajectory +
-  brightness + piece loop). The §7.8.5 **four-point perspective** warp
-  (`perspective_warp::PerspectiveWarp`, the
-  `no_of_sprite_warping_points == 4` case) is implemented and wired into
-  static-sprite reconstruction (`static_sprite_luma_perspective`). The
-  §7.8.3.1 / §7.8.3.2 **hole handling** is modelled by
-  `SpriteObjectBuffer`: it tracks the per-macroblock `send_mb()`
-  occupancy of the sprite-object grid (`object_piece_new_macroblocks`
-  returns the new MBs an object-piece carries a body for, skipping holes
-  already sent by an earlier piece) and validates update-pieces
-  (`update_piece_refined_macroblocks` — every refined MB's object MB must
-  already exist, per the §7.8.3.2 ordering rule). What remains end-to-end
-  is decoding each piece's `sprite_shape_texture()` macroblock body into
-  sprite memory (the object-piece I-VOP / update-piece P-VOP macroblock
-  texture subset).
+- The §7.8.3 **low-latency** static-sprite piece updates
+  (`low_latency_sprite_enable == 1`) — rejected with a typed error.
+  Basic static sprites decode and encode end-to-end (see above). The
+  low-latency syntax shell is parsed (`sprite_piece`: the §6.2.5.4
+  `decode_sprite_piece()` header, the Table 6-26
+  `sprite_transmit_mode` loop, the Table B.35
+  `brightness_change_factor()` VLC) and the §7.8.3.1 / §7.8.3.2 hole
+  bookkeeping is modelled (`SpriteObjectBuffer`); what remains is
+  decoding each piece's `sprite_shape_texture()` macroblock body into
+  sprite memory (the object-piece I-VOP / update-piece P-VOP
+  macroblock texture subset).
+- N-bit video (`not_8_bit == 1` with `bits_per_pixel != 8`, §6.3.3):
+  the VOL parses, the stream decoder declines its VOPs with a typed
+  error (the picture store, the motion-compensation paths and the
+  encoder input are 8-bit; a wider VOL would otherwise be clipped
+  silently). Neither direction codes N-bit pictures.
 - Scalability enhancement layers and non-rectangular shapes (rejected
   with typed errors). The Simple Studio Profile (10-bit intra VOPs, DCT
   or DPCM macroblocks) decodes through the registry decoder only
@@ -603,6 +716,68 @@ both modes' envelopes are pinned).
 - Brightness change in GMC/sprite warping (`brightness_change_factor()`
   / `sprite_brightness_change == 1`) — typed-rejected, since the spec
   mandates `sprite_brightness_change == 0` under GMC.
+
+## Performance
+
+Single-threaded throughput on one Apple-silicon laptop core, release
+build, measured with `benches/throughput.rs` (best of 5 decode / 2
+encode passes; the "before" column is the tree before the round's
+hot-path work, same harness, runs interleaved). The streams are
+60-frame I/P/B sequences produced by a black-box encoder from
+synthetic sources (`ipb`: a test pattern, half-sample; `qpel`: a
+fractal zoom with quarter-sample + 4MV + B-VOPs); the encodes read a
+raw fractal-zoom source. Output is **bit-identical** before and after
+— the harness prints an FNV-1a hash of every decoded sample / emitted
+byte, and the conformance pins and committed encoder fixtures did not
+move.
+
+| Decode | before | after | × |
+|---|---:|---:|---:|
+| 720×576 `ipb` | 402 fps | 793 fps | 2.0 |
+| 720×576 `qpel` | 67 fps | 450 fps | 6.7 |
+| 1280×720 `ipb` | 192 fps | 402 fps | 2.1 |
+| 1280×720 `qpel` | 33 fps | 213 fps | 6.5 |
+| 1920×1080 `ipb` | 64 fps | 129 fps | 2.0 |
+| 1920×1080 `qpel` | 14.7 fps | 97.7 fps | 6.6 |
+
+| Encode (`qp=5`) | before | after | × |
+|---|---:|---:|---:|
+| 720×576, default tools (I/P) | 16.3 fps | 52.5 fps | 3.2 |
+| 720×576, `qpel` + `four-mv` + `bf=2` | 0.76 fps | 17.0 fps | 22 |
+| 720×576, `interlaced` | 6.6 fps | 26.6 fps | 4.0 |
+| 720×576, `interlaced` + `bf=2` | 2.8 fps | 12.7 fps | 4.5 |
+| 1280×720, default tools | 9.3 fps | 31.6 fps | 3.4 |
+| 1920×1080, default tools | 4.6 fps | 15.3 fps | 3.4 |
+
+What changed: the §7.6.2.2 quarter-sample cascade is evaluated
+separably per block (one horizontal pass per reference row, one
+vertical pass per output row, fixed-width row loops) instead of
+re-deriving every tap of every sample; half-sample prediction and the
+encoder's full-pel SADs run on whole plane rows wherever the §7.6.4
+clamp is the identity (the §7.7.2.1 field `mc` routine included),
+the SADs on a byte kernel and stopping once they can no longer win;
+B-VOP mode candidates are scored on a luminance-only prediction; the
+bit reader extracts fields from a 64-bit window and Tables B.16 /
+B.17 decode through a direct lookup; the Annex A.1 transform keeps
+its exact term order but skips zero inputs and advances eight
+accumulators together. Each restructured path is pinned against its
+defining per-sample form by an exhaustive or randomised unit test.
+
+The integer row–column transform (`variant_rc`) accumulates one
+fixed-point basis vector per non-zero input over eight independent
+32-bit lanes and advances the eight columns together, so both passes
+vectorise: 30 ns per dense block against 172 ns for the exact
+transform (25 / 92 ns on sparse blocks). Adding the selection left the
+existing paths where they were — 704×480 I/P/B test pattern 1120 →
+1112 fps (run-to-run noise, same output hash); the same stream forced
+through variant RC decodes at 1199 fps, a dense fractal stream at 682
+against 634 fps.
+
+```text
+MPEG4VIDEO_BENCH_DECODE=a.m4v:b.m4v cargo bench --bench throughput
+MPEG4VIDEO_BENCH_INVERSE_TRANSFORM=variant-rc MPEG4VIDEO_BENCH_DECODE=a.m4v cargo bench --bench throughput
+MPEG4VIDEO_BENCH_ENCODE='1280x720:src.yuv:qp=5,bf=2' cargo bench --bench throughput
+```
 
 ## Fuzzing
 
@@ -620,7 +795,16 @@ the picture size, the tool set (budget / reactive rate control,
 points, B-VOPs, qpel, 4MV, fcode, interlaced tools, method-1
 quantisation, `intra_dc_vlc_thr`, short header) and the content of
 two to four tiny frames, encodes through the registry encoder and
-requires the crate's own decoder to read every frame back. The `Fuzz`
+requires the crate's own decoder to read every frame back — static-sprite
+VOLs with fitted trajectories included. `stream_decode` additionally
+places its bytes behind complete static-sprite heads (every
+warping-point count, two warp accuracies) so they become
+trajectory-only S-VOPs driving the §7.8 warps with arbitrary reference
+points; its decode options rotate with the input over both modes and
+the forced inverse-transform selections, one run decodes the stream
+behind a signed user-data unit (integer transform on every walk), and
+one hands the bytes over as a user-data payload, checking the
+signature rule against an independent reading. The `Fuzz`
 workflow runs all four daily through the org-level reusable job.
 
 ## Provenance

@@ -77,7 +77,7 @@ fn receive_all(dec: &mut dyn Decoder, expected: &[(u32, u32)], seen: &mut usize)
 fn each_frame_reports_its_own_vol_size() {
     let expected: Vec<(u32, u32)> = [(33, 17), (48, 32), (35, 19)]
         .iter()
-        .flat_map(|&size| std::iter::repeat(size).take(4))
+        .flat_map(|&size| std::iter::repeat_n(size, 4))
         .collect();
     let mut dec = literal_decoder();
     dec.send_packet(&Packet::new(0, TimeBase::new(1, 25), [A, B, C].concat()))
@@ -101,7 +101,7 @@ fn each_frame_reports_its_own_vol_size() {
 fn reports_change_with_the_frame_that_carries_the_change() {
     let expected: Vec<(u32, u32)> = [(33, 17), (48, 32)]
         .iter()
-        .flat_map(|&size| std::iter::repeat(size).take(4))
+        .flat_map(|&size| std::iter::repeat_n(size, 4))
         .collect();
     let stream = [A, B].concat();
     let starts: Vec<usize> = (0..stream.len().saturating_sub(3))
